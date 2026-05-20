@@ -602,70 +602,76 @@ void load_trace(const char* filepath) {
         if (*ptr == '\0' || *ptr == '#') continue;
 
         int tx_id = 0;
-        int num_ops = 0;
         int start_tick = 0;
-        if (sscanf(ptr, "TX %d %d %d", &tx_id, &num_ops, &start_tick) == 3) {
-            if (workload_size >= MAX_WORKLOAD_SIZE) {
-                fprintf(stderr, "Workload limit reached (%d)\n", MAX_WORKLOAD_SIZE);
-                break;
+        char op_name[32];
+        if (sscanf(ptr, "T%d %d %31s", &tx_id, &start_tick, op_name) == 3) {
+            Operation op;
+            memset(&op, 0, sizeof(op));
+            bool op_valid = false;
+
+            if (strcmp(op_name, "DEPOSIT") == 0) {
+                op.type = OP_DEPOSIT;
+                if (sscanf(ptr, "T%*d %*d %*s %d %d", &op.account_id, &op.amount_centavos) == 2) {
+                    op_valid = true;
+                }
+            } else if (strcmp(op_name, "WITHDRAW") == 0) {
+                op.type = OP_WITHDRAW;
+                if (sscanf(ptr, "T%*d %*d %*s %d %d", &op.account_id, &op.amount_centavos) == 2) {
+                    op_valid = true;
+                }
+            } else if (strcmp(op_name, "TRANSFER") == 0) {
+                op.type = OP_TRANSFER;
+                if (sscanf(ptr, "T%*d %*d %*s %d %d %d", &op.account_id, &op.target_account, &op.amount_centavos) == 3) {
+                    op_valid = true;
+                }
+            } else if (strcmp(op_name, "BALANCE") == 0) {
+                op.type = OP_BALANCE;
+                if (sscanf(ptr, "T%*d %*d %*s %d", &op.account_id) == 1) {
+                    op_valid = true;
+                }
+            } else {
+                fprintf(stderr, "Unknown operation: %s\n", op_name);
             }
 
-            Transaction* tx = &workload[workload_size];
-            tx->tx_id = tx_id;
-            tx->num_ops = 0;
-            tx->start_tick = start_tick;
-            tx->status = TX_RUNNING;
-
-            if (num_ops > 256) {
-                fprintf(stderr, "Warning: TX %d has %d operations (max 256). Truncating.\n", tx_id, num_ops);
-                num_ops = 256;
-            }
-
-            for (int i = 0; i < num_ops; i++) {
-                char op_line[256];
-                bool op_read = false;
-                while (fgets(op_line, sizeof(op_line), file)) {
-                    char* op_ptr = op_line;
-                    while (isspace((unsigned char)*op_ptr)) op_ptr++;
-                    if (*op_ptr == '\0' || *op_ptr == '#') continue;
-
-                    char op_name[32];
-                    Operation op;
-                    memset(&op, 0, sizeof(op));
-
-                    if (sscanf(op_ptr, "%31s", op_name) == 1) {
-                        if (strcmp(op_name, "DEPOSIT") == 0) {
-                            op.type = OP_DEPOSIT;
-                            if (sscanf(op_ptr, "DEPOSIT %d %d", &op.account_id, &op.amount_centavos) == 2) {
-                                tx->ops[tx->num_ops++] = op;
-                                op_read = true;
-                            }
-                        } else if (strcmp(op_name, "WITHDRAW") == 0) {
-                            op.type = OP_WITHDRAW;
-                            if (sscanf(op_ptr, "WITHDRAW %d %d", &op.account_id, &op.amount_centavos) == 2) {
-                                tx->ops[tx->num_ops++] = op;
-                                op_read = true;
-                            }
-                        } else if (strcmp(op_name, "TRANSFER") == 0) {
-                            op.type = OP_TRANSFER;
-                            if (sscanf(op_ptr, "TRANSFER %d %d %d", &op.account_id, &op.target_account, &op.amount_centavos) == 3) {
-                                tx->ops[tx->num_ops++] = op;
-                                op_read = true;
-                            }
-                        } else if (strcmp(op_name, "BALANCE") == 0) {
-                            op.type = OP_BALANCE;
-                            if (sscanf(op_ptr, "BALANCE %d", &op.account_id) == 1) {
-                                tx->ops[tx->num_ops++] = op;
-                                op_read = true;
-                            }
-                        } else {
-                            fprintf(stderr, "Unknown operation: %s\n", op_name);
-                        }
+            if (op_valid) {
+                // Find if transaction tx_id already exists in workload
+                int idx = -1;
+                for (int i = 0; i < workload_size; i++) {
+                    if (workload[i].tx_id == tx_id) {
+                        idx = i;
+                        break;
                     }
-                    if (op_read) break;
+                }
+
+                if (idx != -1) {
+                    // Transaction exists, append operation if we have space
+                    Transaction* tx = &workload[idx];
+                    if (tx->num_ops < 256) {
+                        tx->ops[tx->num_ops++] = op;
+                    } else {
+                        fprintf(stderr, "Warning: TX %d exceeded max operation count (256). Operation ignored.\n", tx_id);
+                    }
+                } else {
+                    // Create new transaction
+                    if (workload_size >= MAX_WORKLOAD_SIZE) {
+                        fprintf(stderr, "Workload limit reached (%d)\n", MAX_WORKLOAD_SIZE);
+                        break;
+                    }
+                    Transaction* tx = &workload[workload_size];
+                    tx->tx_id = tx_id;
+                    tx->start_tick = start_tick;
+                    tx->ops[0] = op;
+                    tx->num_ops = 1;
+                    tx->status = TX_RUNNING;
+                    tx->thread = 0;
+                    tx->actual_start = 0;
+                    tx->actual_end = 0;
+                    tx->wait_ticks = 0;
+                    workload_size++;
                 }
             }
-            workload_size++;
+        } else {
+            fprintf(stderr, "Malformatted trace line: %s\n", line);
         }
     }
 
