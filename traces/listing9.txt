@@ -1,8 +1,0 @@
-# Banking transaction trace matching Listing 9
-# Format: TxID StartTick Operation AccountID [Amount] [TargetAccount]
-
-T1 0 DEPOSIT 10 5000
-T2 1 WITHDRAW 10 2000
-T3 2 TRANSFER 10 20 3000
-T4 2 TRANSFER 20 10 1500
-T5 5 BALANCE 10
