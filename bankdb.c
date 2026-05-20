@@ -327,6 +327,13 @@ bool transfer ( int from_id , int to_id , int amount_centavos, int tx_id ) {
         fflush(stdout);
         if (log_file) fflush(log_file);
         pthread_mutex_unlock(&log_mutex);
+
+        for (int i = 0; i < workload_size; i++) {
+            if (workload[i].tx_id == tx_id) {
+                workload[i].wait_ticks += 1;
+                break;
+            }
+        }
     }
 
     // Acquire locks in consistent order to prevent deadlock
@@ -426,6 +433,9 @@ void * execute_transaction ( void * arg ) {
     tx -> actual_start = global_tick ;
     pthread_mutex_unlock(&tick_lock);
 
+    tx -> wait_ticks = 0;
+    int current_target_tick = tx -> actual_start;
+
     CompletedOp completed_ops[256];
     int completed_count = 0;
 
@@ -467,7 +477,7 @@ void * execute_transaction ( void * arg ) {
         pthread_mutex_unlock(&log_mutex);
 
         pthread_mutex_lock(&tick_lock);
-        int tick_before = global_tick ;
+        int lock_start = global_tick ;
         pthread_mutex_unlock(&tick_lock);
 
         bool op_success = true;
@@ -476,7 +486,14 @@ void * execute_transaction ( void * arg ) {
         case OP_DEPOSIT :
             deposit ( op -> account_id , op -> amount_centavos ) ;
             completed_ops[completed_count++] = (CompletedOp){OP_DEPOSIT, op->account_id, op->amount_centavos, 0};
-            wait_until_tick(tx->start_tick + 1);
+            
+            pthread_mutex_lock(&tick_lock);
+            int lock_end_dep = global_tick;
+            pthread_mutex_unlock(&tick_lock);
+            tx->wait_ticks += (lock_end_dep - lock_start);
+            current_target_tick += 1;
+
+            wait_until_tick(current_target_tick + tx->wait_ticks);
             pthread_mutex_lock(&log_mutex);
             printf("T%d completed : DEPOSIT successful\n", tx->tx_id);
             if (log_file) {
@@ -490,7 +507,14 @@ void * execute_transaction ( void * arg ) {
         case OP_WITHDRAW :
             if (! withdraw ( op -> account_id , op -> amount_centavos ) ) {
                 op_success = false;
-                wait_until_tick(tx->start_tick + 1);
+                
+                pthread_mutex_lock(&tick_lock);
+                int lock_end_wdr = global_tick;
+                pthread_mutex_unlock(&tick_lock);
+                tx->wait_ticks += (lock_end_wdr - lock_start);
+                current_target_tick += 1;
+
+                wait_until_tick(current_target_tick + tx->wait_ticks);
                 pthread_mutex_lock(&log_mutex);
                 printf("T%d completed : WITHDRAW failed\n", tx->tx_id);
                 if (log_file) {
@@ -501,7 +525,14 @@ void * execute_transaction ( void * arg ) {
                 pthread_mutex_unlock(&log_mutex);
             } else {
                 completed_ops[completed_count++] = (CompletedOp){OP_WITHDRAW, op->account_id, op->amount_centavos, 0};
-                wait_until_tick(tx->start_tick + 1);
+
+                pthread_mutex_lock(&tick_lock);
+                int lock_end_wdr = global_tick;
+                pthread_mutex_unlock(&tick_lock);
+                tx->wait_ticks += (lock_end_wdr - lock_start);
+                current_target_tick += 1;
+
+                wait_until_tick(current_target_tick + tx->wait_ticks);
                 pthread_mutex_lock(&log_mutex);
                 printf("T%d completed : WITHDRAW successful\n", tx->tx_id);
                 if (log_file) {
@@ -517,7 +548,14 @@ void * execute_transaction ( void * arg ) {
             if (! transfer ( op -> account_id , op -> target_account ,
                             op -> amount_centavos, tx -> tx_id ) ) {
                 op_success = false;
-                wait_until_tick(tx->start_tick + 2);
+
+                pthread_mutex_lock(&tick_lock);
+                int lock_end_trf = global_tick;
+                pthread_mutex_unlock(&tick_lock);
+                tx->wait_ticks += (lock_end_trf - lock_start);
+                current_target_tick += 1;
+
+                wait_until_tick(current_target_tick + tx->wait_ticks);
                 pthread_mutex_lock(&log_mutex);
                 printf("T%d completed : TRANSFER failed\n", tx->tx_id);
                 if (log_file) {
@@ -528,7 +566,14 @@ void * execute_transaction ( void * arg ) {
                 pthread_mutex_unlock(&log_mutex);
             } else {
                 completed_ops[completed_count++] = (CompletedOp){OP_TRANSFER, op->account_id, op->amount_centavos, op->target_account};
-                wait_until_tick(tx->start_tick + 2);
+
+                pthread_mutex_lock(&tick_lock);
+                int lock_end_trf = global_tick;
+                pthread_mutex_unlock(&tick_lock);
+                tx->wait_ticks += (lock_end_trf - lock_start);
+                current_target_tick += 1;
+
+                wait_until_tick(current_target_tick + tx->wait_ticks);
                 pthread_mutex_lock(&log_mutex);
                 printf("T%d completed : TRANSFER successful\n", tx->tx_id);
                 if (log_file) {
@@ -542,6 +587,12 @@ void * execute_transaction ( void * arg ) {
 
         case OP_BALANCE : {
             int balance = get_balance ( op -> account_id ) ;
+
+            pthread_mutex_lock(&tick_lock);
+            int lock_end_bal = global_tick;
+            pthread_mutex_unlock(&tick_lock);
+            tx->wait_ticks += (lock_end_bal - lock_start);
+
             pthread_mutex_lock(&log_mutex);
             printf ("T%d : Account %d balance = PHP %d.%02d\n",
                     tx -> tx_id , op -> account_id ,
@@ -557,12 +608,6 @@ void * execute_transaction ( void * arg ) {
             break ;
         }
         }
-
-        pthread_mutex_lock(&tick_lock);
-        int tick_after = global_tick;
-        pthread_mutex_unlock(&tick_lock);
-
-        tx -> wait_ticks += ( tick_after - tick_before ) ;
 
         if (!op_success) {
             // Rollback completed operations in reverse order
@@ -916,6 +961,21 @@ int main(int argc, char* argv[]) {
     printf("Aborted : %d\n", fail);
     printf("Total ticks : %d\n", sim_clock + 1);
     printf("ThreadSanitizer warnings : 0\n");
+
+    printf("\n=== Transaction Performance Metrics ===\n");
+    printf("TxID | StartTick | ActualStart | End | WaitTicks | Status\n");
+    printf("- - - - -| - - - - - - - - - - -| - - - - - - - - - - - - -| - - - - -| - - - - - - - - - - -| - - - - - - - - - -\n");
+    double total_wait_t = 0;
+    for (int i = 0; i < workload_size; i++) {
+        Transaction tx = workload[i];
+        const char *status_str = (tx.status == TX_COMMITTED) ? "COMMITTED" : "ABORTED";
+        printf("T%d | %d | %d | %d | %d | %s\n",
+               tx.tx_id, tx.start_tick, tx.actual_start, tx.actual_end, tx.wait_ticks, status_str);
+        total_wait_t += tx.wait_ticks;
+    }
+    printf("\nAverage wait time : %.1f ticks\n", total_wait_t / workload_size);
+    printf("Throughput : %d transactions / %d ticks = %.2f tx / tick\n",
+           workload_size, sim_clock + 1, (double)workload_size / (sim_clock + 1));
 
     if (verbose) {
         printf("\n=========================================\n");
