@@ -19,6 +19,7 @@
 #define NUM_WORKERS 4
 #define MAX_WORKLOAD_SIZE 10000
 #define TICK_INTERVAL_MS 10
+#define BUFFER_POOL_SIZE 5
 
 typedef enum {
     OP_DEPOSIT,    // Add money to account
@@ -78,9 +79,23 @@ typedef struct {
     sem_t filled_slots;
 } BoundedBuffer;
 
+typedef struct {
+    int account_id ;
+    Account * data ;
+    bool in_use ;
+} BufferSlot ;
+
+typedef struct {
+    BufferSlot slots [ BUFFER_POOL_SIZE ];
+    sem_t empty_slots ;
+    sem_t full_slots ;
+    pthread_mutex_t pool_lock ;
+} BufferPool ;
+
 // Globals
 Bank bank;
 BoundedBuffer tx_queue;
+BufferPool buffer_pool;
 pthread_mutex_t log_mutex;
 FILE* log_file = NULL;
 
@@ -93,6 +108,7 @@ pthread_cond_t tick_changed;
 _Atomic bool simulation_running = true;
 
 sem_t worker_sem;
+pthread_mutex_t load_phase_lock;
 
 _Atomic uint64_t total_lock_wait_ns = 0;
 _Atomic uint64_t max_lock_wait_ns = 0;
@@ -153,6 +169,65 @@ void fetch_transaction(BoundedBuffer* b, Transaction* tx) {
     sem_post(&b->empty_slots);
 }
 
+void init_buffer_pool ( BufferPool * pool ) {
+    sem_init (& pool -> empty_slots , 0 , BUFFER_POOL_SIZE ) ;
+    sem_init (& pool -> full_slots , 0 , 0) ;
+    pthread_mutex_init (& pool -> pool_lock , NULL ) ;
+    for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
+        pool->slots[i].in_use = false;
+        pool->slots[i].account_id = -1;
+        pool->slots[i].data = NULL;
+    }
+}
+
+void destroy_buffer_pool(BufferPool* pool) {
+    sem_destroy(&pool->empty_slots);
+    sem_destroy(&pool->full_slots);
+    pthread_mutex_destroy(&pool->pool_lock);
+}
+
+// Load account into buffer pool ( producer )
+void load_account ( BufferPool * pool , int account_id ) {
+    sem_wait (& pool -> empty_slots ) ; // Wait for empty slot
+
+    pthread_mutex_lock (& pool -> pool_lock ) ;
+
+    // Find empty slot and load account
+    for (int i = 0; i < BUFFER_POOL_SIZE ; i ++) {
+        if (! pool -> slots [ i ]. in_use ) {
+            pool -> slots [ i ]. account_id = account_id ;
+            pool -> slots [ i ]. data = & bank . accounts [ account_id ];
+            pool -> slots [ i ]. in_use = true ;
+            break ;
+        }
+    }
+
+    pthread_mutex_unlock (& pool -> pool_lock ) ;
+
+    sem_post (& pool -> full_slots ) ; // Signal slot is full
+}
+
+// Unload account from buffer pool ( consumer )
+void unload_account ( BufferPool * pool , int account_id ) {
+    sem_wait (& pool -> full_slots ) ; // Wait for full slot
+
+    pthread_mutex_lock (& pool -> pool_lock ) ;
+
+    // Find and unload account
+    for (int i = 0; i < BUFFER_POOL_SIZE ; i ++) {
+        if ( pool -> slots [ i ]. in_use &&
+             pool -> slots [ i ]. account_id == account_id ) {
+            pool -> slots [ i ]. in_use = false ;
+            pool -> slots [ i ]. account_id = -1;
+            break ;
+        }
+    }
+
+    pthread_mutex_unlock (& pool -> pool_lock ) ;
+
+    sem_post (& pool -> empty_slots ) ; // Signal slot is empty
+}
+
 // Timer thread increments clock every TICK_INTERVAL_MS
 void * timer_thread ( void * arg ) {
     (void)arg;
@@ -210,18 +285,20 @@ bool withdraw ( int account_id , int amount_centavos ) {
 }
 
 bool transfer ( int from_id , int to_id , int amount_centavos ) {
-    // This is where deadlock can occur! Sorted lock acquisition is used to prevent it.
-    Account* acc_from = &bank.accounts[from_id];
-    Account* acc_to = &bank.accounts[to_id];
+    if (from_id == to_id) {
+        return true;
+    }
+
+    // Acquire locks in consistent order to prevent deadlock
+    int first = ( from_id < to_id ) ? from_id : to_id ;
+    int second = ( from_id < to_id ) ? to_id : from_id ;
+
+    Account * acc_first = & bank . accounts [ first ];
+    Account * acc_second = & bank . accounts [ second ];
 
     uint64_t start_wait = get_time_ns();
-    if (from_id < to_id) {
-        pthread_rwlock_wrlock(&acc_from->lock);
-        pthread_rwlock_wrlock(&acc_to->lock);
-    } else {
-        pthread_rwlock_wrlock(&acc_to->lock);
-        pthread_rwlock_wrlock(&acc_from->lock);
-    }
+    pthread_rwlock_wrlock (& acc_first -> lock ) ;
+    pthread_rwlock_wrlock (& acc_second -> lock ) ;
     uint64_t end_wait = get_time_ns();
     uint64_t tx_wait_ns = end_wait - start_wait;
     
@@ -234,25 +311,76 @@ bool transfer ( int from_id , int to_id , int amount_centavos ) {
         }
     }
 
-    if (acc_from->balance_centavos < amount_centavos) {
-        pthread_rwlock_unlock(&acc_to->lock);
-        pthread_rwlock_unlock(&acc_from->lock);
-        return false;
+    // Check sufficient funds
+    Account * from_acc = & bank . accounts [ from_id ];
+    if ( from_acc -> balance_centavos < amount_centavos ) {
+        pthread_rwlock_unlock (& acc_second -> lock ) ;
+        pthread_rwlock_unlock (& acc_first -> lock ) ;
+        return false ;
     }
 
-    acc_from->balance_centavos -= amount_centavos;
-    acc_to->balance_centavos += amount_centavos;
+    // Perform transfer
+    bank . accounts [ from_id ]. balance_centavos -= amount_centavos ;
+    bank . accounts [ to_id ]. balance_centavos += amount_centavos ;
 
-    pthread_rwlock_unlock(&acc_to->lock);
-    pthread_rwlock_unlock(&acc_from->lock);
-    return true;
+    pthread_rwlock_unlock (& acc_second -> lock ) ;
+    pthread_rwlock_unlock (& acc_first -> lock ) ;
+    return true ;
 }
 
 void * execute_transaction ( void * arg ) {
     Transaction * tx = ( Transaction *) arg ;
 
+    // Collect all unique accounts accessed by this transaction
+    int unique_accounts[256];
+    int unique_count = 0;
+    for (int i = 0; i < tx->num_ops; i++) {
+        Operation op = tx->ops[i];
+        bool found = false;
+        for (int j = 0; j < unique_count; j++) {
+            if (unique_accounts[j] == op.account_id) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            unique_accounts[unique_count++] = op.account_id;
+        }
+
+        if (op.type == OP_TRANSFER) {
+            found = false;
+            for (int j = 0; j < unique_count; j++) {
+                if (unique_accounts[j] == op.target_account) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                unique_accounts[unique_count++] = op.target_account;
+            }
+        }
+    }
+
+    // Sort unique account IDs to prevent deadlocks in buffer pool loading
+    for (int i = 0; i < unique_count - 1; i++) {
+        for (int j = i + 1; j < unique_count; j++) {
+            if (unique_accounts[i] > unique_accounts[j]) {
+                int tmp = unique_accounts[i];
+                unique_accounts[i] = unique_accounts[j];
+                unique_accounts[j] = tmp;
+            }
+        }
+    }
+
     // Wait until scheduled start time
     wait_until_tick ( tx -> start_tick ) ;
+
+    // Load accounts into the bounded buffer pool atomically
+    pthread_mutex_lock(&load_phase_lock);
+    for (int i = 0; i < unique_count; i++) {
+        load_account(&buffer_pool, unique_accounts[i]);
+    }
+    pthread_mutex_unlock(&load_phase_lock);
 
     pthread_mutex_lock(&tick_lock);
     tx -> actual_start = global_tick ;
@@ -357,6 +485,11 @@ void * execute_transaction ( void * arg ) {
             if (log_file) fflush(log_file);
             pthread_mutex_unlock(&log_mutex);
 
+            // Unload accounts from the bounded buffer pool
+            for (int i = 0; i < unique_count; i++) {
+                unload_account(&buffer_pool, unique_accounts[i]);
+            }
+
             sem_post(&worker_sem);
             return NULL ;
         }
@@ -409,6 +542,11 @@ void * execute_transaction ( void * arg ) {
     fflush(stdout);
     if (log_file) fflush(log_file);
     pthread_mutex_unlock(&log_mutex);
+
+    // Unload accounts from the bounded buffer pool
+    for (int i = 0; i < unique_count; i++) {
+        unload_account(&buffer_pool, unique_accounts[i]);
+    }
 
     sem_post(&worker_sem);
 
@@ -559,16 +697,19 @@ int main(int argc, char* argv[]) {
     pthread_mutex_init(&tick_lock, NULL);
     pthread_cond_init(&tick_changed, NULL);
     sem_init(&worker_sem, 0, num_workers);
+    pthread_mutex_init(&load_phase_lock, NULL);
 
     printf("=========================================\n");
     printf("Initializing Concurrent BankDB...\n");
     printf("  Workers     : %d\n", num_workers);
     printf("  Max Accounts: %d\n", MAX_ACCOUNTS);
     printf("  Buffer Size : %d\n", BUFFER_SIZE);
+    printf("  Pool Size   : %d\n", BUFFER_POOL_SIZE);
     printf("=========================================\n");
 
     init_bank();
     init_buffer(&tx_queue);
+    init_buffer_pool(&buffer_pool);
 
     printf("Loading workload from %s...\n", trace_path);
     load_trace(trace_path);
@@ -665,10 +806,12 @@ int main(int argc, char* argv[]) {
     }
     pthread_mutex_destroy(&bank.bank_lock);
     destroy_buffer(&tx_queue);
+    destroy_buffer_pool(&buffer_pool);
     pthread_mutex_destroy(&log_mutex);
     pthread_mutex_destroy(&tick_lock);
     pthread_cond_destroy(&tick_changed);
     sem_destroy(&worker_sem);
+    pthread_mutex_destroy(&load_phase_lock);
     if (log_file) fclose(log_file);
 
     return EXIT_SUCCESS;

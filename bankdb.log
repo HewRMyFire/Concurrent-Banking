@@ -1,9 +1,9 @@
 [Clock: 1] Worker 140737260799680 processed TX 300 -> COMMITTED [Sched:0, Actual:1-1, Wait:0 ticks] [Ops: DEP(0, 100000) DEP(1, 100000) DEP(2, 100000) ]
 [Clock: 1] Worker 140737252406976 processed TX 301 -> COMMITTED [Sched:1, Actual:1-1, Wait:0 ticks] [Ops: TRF(0->1, 50000) ]
-[Clock: 1] Worker 140737244014272 processed TX 302 -> COMMITTED [Sched:1, Actual:1-1, Wait:0 ticks] [Ops: TRF(1->0, 30000) ]
-T304: Account 2 balance = PHP 4000 .00
+[Clock: 3] Worker 140737235621568 processed TX 303 -> ABORTED [Sched:2, Actual:2-3, Wait:0 ticks]
+T304: Account 2 balance = PHP 2000 .00
+[Clock: 4] Worker 140737244014272 processed TX 302 -> COMMITTED [Sched:1, Actual:2-4, Wait:2 ticks] [Ops: TRF(1->0, 30000) ]
+[Clock: 4] Worker 140737227228864 processed TX 304 -> COMMITTED [Sched:3, Actual:3-4, Wait:1 ticks] [Ops: BAL(2) ]
+[Clock: 4] Worker 140737218836160 processed TX 305 -> COMMITTED [Sched:4, Actual:4-4, Wait:0 ticks] [Ops: DEP(8, 100000) DEP(9, 100000) ]
 [Clock: 5] Worker 140737210443456 processed TX 306 -> COMMITTED [Sched:5, Actual:5-5, Wait:0 ticks] [Ops: TRF(8->9, 20000) ]
-[Clock: 5] Worker 140737235621568 processed TX 303 -> ABORTED [Sched:2, Actual:2-5, Wait:2 ticks]
-[Clock: 5] Worker 140737227228864 processed TX 304 -> COMMITTED [Sched:3, Actual:3-5, Wait:0 ticks] [Ops: BAL(2) ]
-[Clock: 5] Worker 140737218836160 processed TX 305 -> COMMITTED [Sched:4, Actual:5-5, Wait:0 ticks] [Ops: DEP(8, 100000) DEP(9, 100000) ]
-[Clock: 6] Worker 140737202050752 processed TX 307 -> COMMITTED [Sched:5, Actual:6-6, Wait:0 ticks] [Ops: TRF(9->8, 40000) ]
+[Clock: 5] Worker 140737202050752 processed TX 307 -> COMMITTED [Sched:5, Actual:5-5, Wait:0 ticks] [Ops: TRF(9->8, 40000) ]
