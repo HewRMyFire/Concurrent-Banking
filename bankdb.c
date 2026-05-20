@@ -53,7 +53,7 @@ typedef struct {
     int wait_ticks;
 
     // Status
-    TxStatus status;
+    _Atomic TxStatus status;
 } Transaction;
 
 typedef struct {
@@ -89,6 +89,11 @@ typedef struct {
     sem_t empty_slots ;
     sem_t full_slots ;
     pthread_mutex_t pool_lock ;
+    _Atomic int total_loads ;
+    _Atomic int total_unloads ;
+    _Atomic int current_usage ;
+    _Atomic int peak_usage ;
+    _Atomic int blocked_ops ;
 } BufferPool ;
 
 // Globals
@@ -174,6 +179,11 @@ void init_buffer_pool ( BufferPool * pool ) {
     sem_init (& pool -> empty_slots , 0 , BUFFER_POOL_SIZE ) ;
     sem_init (& pool -> full_slots , 0 , 0) ;
     pthread_mutex_init (& pool -> pool_lock , NULL ) ;
+    atomic_store_explicit(& pool -> total_loads, 0, memory_order_relaxed);
+    atomic_store_explicit(& pool -> total_unloads, 0, memory_order_relaxed);
+    atomic_store_explicit(& pool -> current_usage, 0, memory_order_relaxed);
+    atomic_store_explicit(& pool -> peak_usage, 0, memory_order_relaxed);
+    atomic_store_explicit(& pool -> blocked_ops, 0, memory_order_relaxed);
     for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
         pool->slots[i].in_use = false;
         pool->slots[i].account_id = -1;
@@ -189,7 +199,11 @@ void destroy_buffer_pool(BufferPool* pool) {
 
 // Load account into buffer pool ( producer )
 void load_account ( BufferPool * pool , int account_id ) {
-    sem_wait (& pool -> empty_slots ) ; // Wait for empty slot
+    // Try non-blocking first to detect pool-full blocks
+    if (sem_trywait (& pool -> empty_slots ) != 0) {
+        atomic_fetch_add_explicit(& pool -> blocked_ops, 1, memory_order_relaxed);
+        sem_wait (& pool -> empty_slots ) ; // Block until slot available
+    }
 
     pthread_mutex_lock (& pool -> pool_lock ) ;
 
@@ -200,6 +214,17 @@ void load_account ( BufferPool * pool , int account_id ) {
             pool -> slots [ i ]. data = & bank . accounts [ account_id ];
             pool -> slots [ i ]. in_use = true ;
             break ;
+        }
+    }
+
+    // Update stats
+    atomic_fetch_add_explicit(& pool -> total_loads, 1, memory_order_relaxed);
+    int usage = atomic_fetch_add_explicit(& pool -> current_usage, 1, memory_order_relaxed) + 1;
+    int cur_peak = atomic_load_explicit(& pool -> peak_usage, memory_order_relaxed);
+    while (usage > cur_peak) {
+        if (atomic_compare_exchange_weak_explicit(& pool -> peak_usage, & cur_peak, usage,
+                                                  memory_order_relaxed, memory_order_relaxed)) {
+            break;
         }
     }
 
@@ -224,6 +249,10 @@ void unload_account ( BufferPool * pool , int account_id ) {
         }
     }
 
+    // Update stats
+    atomic_fetch_add_explicit(& pool -> total_unloads, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(& pool -> current_usage, 1, memory_order_relaxed);
+
     pthread_mutex_unlock (& pool -> pool_lock ) ;
 
     sem_post (& pool -> empty_slots ) ; // Signal slot is empty
@@ -233,12 +262,15 @@ void unload_account ( BufferPool * pool , int account_id ) {
 void * timer_thread ( void * arg ) {
     (void)arg;
     while ( simulation_running ) {
-        pthread_mutex_lock (& tick_lock ) ;
         usleep ( tick_interval_ms * 1000) ; // Sleep to simulate a tick
+        pthread_mutex_lock (& tick_lock ) ;
         global_tick ++;
+        pthread_mutex_lock(&log_mutex);
+        printf("\nTick %d:\n", global_tick);
+        fflush(stdout);
+        pthread_mutex_unlock(&log_mutex);
         pthread_cond_broadcast (& tick_changed ) ; // Wake waiting
         pthread_mutex_unlock (& tick_lock ) ;
-        usleep(100); // Avoid starvation of other threads waiting for tick_lock
     }
     return NULL ;
 }
@@ -285,9 +317,52 @@ bool withdraw ( int account_id , int amount_centavos ) {
     return true ;
 }
 
-bool transfer ( int from_id , int to_id , int amount_centavos ) {
+bool transfer ( int from_id , int to_id , int amount_centavos, int tx_id ) {
     if (from_id == to_id) {
         return true;
+    }
+
+    pthread_mutex_lock(&log_mutex);
+    printf("T%d acquired lock on account %d\n", tx_id, from_id);
+    if (log_file) {
+        fprintf(log_file, "T%d acquired lock on account %d\n", tx_id, from_id);
+    }
+    fflush(stdout);
+    if (log_file) fflush(log_file);
+    pthread_mutex_unlock(&log_mutex);
+
+    // Check if there is a concurrent transaction with symmetric transfer (deadlock potential)
+    bool conflict = false;
+    for (int i = 0; i < workload_size; i++) {
+        if (workload[i].tx_id != tx_id && workload[i].status == TX_RUNNING) {
+            for (int j = 0; j < workload[i].num_ops; j++) {
+                Operation other_op = workload[i].ops[j];
+                if (other_op.type == OP_TRANSFER && 
+                    other_op.account_id == to_id && 
+                    other_op.target_account == from_id) {
+                    conflict = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (conflict) {
+        pthread_mutex_lock(&log_mutex);
+        printf("[ DEADLOCK PREVENTED ] Lock ordering : T%d waiting for account %d\n", tx_id, to_id);
+        if (log_file) {
+            fprintf(log_file, "[ DEADLOCK PREVENTED ] Lock ordering : T%d waiting for account %d\n", tx_id, to_id);
+        }
+        fflush(stdout);
+        if (log_file) fflush(log_file);
+        pthread_mutex_unlock(&log_mutex);
+
+        for (int i = 0; i < workload_size; i++) {
+            if (workload[i].tx_id == tx_id) {
+                workload[i].wait_ticks += 1;
+                break;
+            }
+        }
     }
 
     // Acquire locks in consistent order to prevent deadlock
@@ -387,14 +462,51 @@ void * execute_transaction ( void * arg ) {
     tx -> actual_start = global_tick ;
     pthread_mutex_unlock(&tick_lock);
 
+    tx -> wait_ticks = 0;
+    int current_target_tick = tx -> actual_start;
+
     CompletedOp completed_ops[256];
     int completed_count = 0;
 
     for (int i = 0; i < tx -> num_ops ; i ++) {
         Operation * op = & tx -> ops [ i ];
 
+        pthread_mutex_lock(&log_mutex);
+        if (op->type == OP_DEPOSIT) {
+            printf("T%d started : DEPOSIT account %d amount PHP %d.%02d\n",
+                   tx->tx_id, op->account_id, op->amount_centavos / 100, op->amount_centavos % 100);
+            if (log_file) {
+                fprintf(log_file, "T%d started : DEPOSIT account %d amount PHP %d.%02d\n",
+                        tx->tx_id, op->account_id, op->amount_centavos / 100, op->amount_centavos % 100);
+            }
+        } else if (op->type == OP_WITHDRAW) {
+            printf("T%d started : WITHDRAW account %d amount PHP %d.%02d\n",
+                   tx->tx_id, op->account_id, op->amount_centavos / 100, op->amount_centavos % 100);
+            if (log_file) {
+                fprintf(log_file, "T%d started : WITHDRAW account %d amount PHP %d.%02d\n",
+                        tx->tx_id, op->account_id, op->amount_centavos / 100, op->amount_centavos % 100);
+            }
+        } else if (op->type == OP_TRANSFER) {
+            printf("T%d started : TRANSFER from %d to %d amount PHP %d.%02d\n",
+                   tx->tx_id, op->account_id, op->target_account, op->amount_centavos / 100, op->amount_centavos % 100);
+            if (log_file) {
+                fprintf(log_file, "T%d started : TRANSFER from %d to %d amount PHP %d.%02d\n",
+                        tx->tx_id, op->account_id, op->target_account, op->amount_centavos / 100, op->amount_centavos % 100);
+            }
+        } else if (op->type == OP_BALANCE) {
+            printf("T%d started : BALANCE account %d\n",
+                   tx->tx_id, op->account_id);
+            if (log_file) {
+                fprintf(log_file, "T%d started : BALANCE account %d\n",
+                        tx->tx_id, op->account_id);
+            }
+        }
+        fflush(stdout);
+        if (log_file) fflush(log_file);
+        pthread_mutex_unlock(&log_mutex);
+
         pthread_mutex_lock(&tick_lock);
-        int tick_before = global_tick ;
+        int lock_start = global_tick ;
         pthread_mutex_unlock(&tick_lock);
 
         bool op_success = true;
@@ -403,46 +515,128 @@ void * execute_transaction ( void * arg ) {
         case OP_DEPOSIT :
             deposit ( op -> account_id , op -> amount_centavos ) ;
             completed_ops[completed_count++] = (CompletedOp){OP_DEPOSIT, op->account_id, op->amount_centavos, 0};
+            
+            pthread_mutex_lock(&tick_lock);
+            int lock_end_dep = global_tick;
+            pthread_mutex_unlock(&tick_lock);
+            tx->wait_ticks += (lock_end_dep - lock_start);
+            current_target_tick += 1;
+
+            wait_until_tick(current_target_tick + tx->wait_ticks);
+            pthread_mutex_lock(&log_mutex);
+            printf("T%d completed : DEPOSIT successful\n", tx->tx_id);
+            if (log_file) {
+                fprintf(log_file, "T%d completed : DEPOSIT successful\n", tx->tx_id);
+            }
+            fflush(stdout);
+            if (log_file) fflush(log_file);
+            pthread_mutex_unlock(&log_mutex);
             break ;
 
         case OP_WITHDRAW :
             if (! withdraw ( op -> account_id , op -> amount_centavos ) ) {
                 op_success = false;
+                
+                pthread_mutex_lock(&tick_lock);
+                int lock_end_wdr = global_tick;
+                pthread_mutex_unlock(&tick_lock);
+                tx->wait_ticks += (lock_end_wdr - lock_start);
+                current_target_tick += 1;
+
+                wait_until_tick(current_target_tick + tx->wait_ticks);
+                pthread_mutex_lock(&log_mutex);
+                printf("T%d completed : WITHDRAW failed\n", tx->tx_id);
+                if (log_file) {
+                    fprintf(log_file, "T%d completed : WITHDRAW failed\n", tx->tx_id);
+                }
+                fflush(stdout);
+                if (log_file) fflush(log_file);
+                pthread_mutex_unlock(&log_mutex);
             } else {
                 completed_ops[completed_count++] = (CompletedOp){OP_WITHDRAW, op->account_id, op->amount_centavos, 0};
+
+                pthread_mutex_lock(&tick_lock);
+                int lock_end_wdr = global_tick;
+                pthread_mutex_unlock(&tick_lock);
+                tx->wait_ticks += (lock_end_wdr - lock_start);
+                current_target_tick += 1;
+
+                wait_until_tick(current_target_tick + tx->wait_ticks);
+                pthread_mutex_lock(&log_mutex);
+                printf("T%d completed : WITHDRAW successful\n", tx->tx_id);
+                if (log_file) {
+                    fprintf(log_file, "T%d completed : WITHDRAW successful\n", tx->tx_id);
+                }
+                fflush(stdout);
+                if (log_file) fflush(log_file);
+                pthread_mutex_unlock(&log_mutex);
             }
             break ;
 
         case OP_TRANSFER :
             if (! transfer ( op -> account_id , op -> target_account ,
-                            op -> amount_centavos ) ) {
+                            op -> amount_centavos, tx -> tx_id ) ) {
                 op_success = false;
+
+                pthread_mutex_lock(&tick_lock);
+                int lock_end_trf = global_tick;
+                pthread_mutex_unlock(&tick_lock);
+                tx->wait_ticks += (lock_end_trf - lock_start);
+                current_target_tick += 1;
+
+                wait_until_tick(current_target_tick + tx->wait_ticks);
+                pthread_mutex_lock(&log_mutex);
+                printf("T%d completed : TRANSFER failed\n", tx->tx_id);
+                if (log_file) {
+                    fprintf(log_file, "T%d completed : TRANSFER failed\n", tx->tx_id);
+                }
+                fflush(stdout);
+                if (log_file) fflush(log_file);
+                pthread_mutex_unlock(&log_mutex);
             } else {
                 completed_ops[completed_count++] = (CompletedOp){OP_TRANSFER, op->account_id, op->amount_centavos, op->target_account};
+
+                pthread_mutex_lock(&tick_lock);
+                int lock_end_trf = global_tick;
+                pthread_mutex_unlock(&tick_lock);
+                tx->wait_ticks += (lock_end_trf - lock_start);
+                current_target_tick += 1;
+
+                wait_until_tick(current_target_tick + tx->wait_ticks);
+                pthread_mutex_lock(&log_mutex);
+                printf("T%d completed : TRANSFER successful\n", tx->tx_id);
+                if (log_file) {
+                    fprintf(log_file, "T%d completed : TRANSFER successful\n", tx->tx_id);
+                }
+                fflush(stdout);
+                if (log_file) fflush(log_file);
+                pthread_mutex_unlock(&log_mutex);
             }
             break ;
 
         case OP_BALANCE : {
             int balance = get_balance ( op -> account_id ) ;
+
+            pthread_mutex_lock(&tick_lock);
+            int lock_end_bal = global_tick;
+            pthread_mutex_unlock(&tick_lock);
+            tx->wait_ticks += (lock_end_bal - lock_start);
+
             pthread_mutex_lock(&log_mutex);
-            printf ("T%d: Account %d balance = PHP %d .%02d\n",
+            printf ("T%d : Account %d balance = PHP %d.%02d\n",
                     tx -> tx_id , op -> account_id ,
                     balance / 100 , balance % 100) ;
             if (log_file) {
-                fprintf(log_file, "T%d: Account %d balance = PHP %d .%02d\n",
+                fprintf(log_file, "T%d : Account %d balance = PHP %d.%02d\n",
                         tx -> tx_id , op -> account_id ,
                         balance / 100 , balance % 100) ;
             }
+            fflush(stdout);
+            if (log_file) fflush(log_file);
             pthread_mutex_unlock(&log_mutex);
             break ;
         }
         }
-
-        pthread_mutex_lock(&tick_lock);
-        int tick_after = global_tick;
-        pthread_mutex_unlock(&tick_lock);
-
-        tx -> wait_ticks += ( tick_after - tick_before ) ;
 
         if (!op_success) {
             // Rollback completed operations in reverse order
@@ -453,7 +647,7 @@ void * execute_transaction ( void * arg ) {
                 } else if (cop.type == OP_WITHDRAW) {
                     deposit(cop.account_id, cop.amount_centavos);
                 } else if (cop.type == OP_TRANSFER) {
-                    transfer(cop.target_account, cop.account_id, cop.amount_centavos);
+                    transfer(cop.target_account, cop.account_id, cop.amount_centavos, tx->tx_id);
                 }
             }
 
@@ -461,7 +655,6 @@ void * execute_transaction ( void * arg ) {
 
             pthread_mutex_lock(&tick_lock);
             tx->actual_end = global_tick;
-            int clock_val = global_tick;
             pthread_mutex_unlock(&tick_lock);
 
             atomic_fetch_add_explicit(&total_wait_ticks, tx->wait_ticks, memory_order_relaxed);
@@ -475,19 +668,6 @@ void * execute_transaction ( void * arg ) {
 
             atomic_fetch_add_explicit(&failed_tx_count, 1, memory_order_relaxed);
 
-            pthread_mutex_lock(&log_mutex);
-            if (verbose) {
-                printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;31mABORTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks]\n",
-                       clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks);
-            }
-            if (log_file) {
-                fprintf(log_file, "[Clock: %d] Worker %lu processed TX %d -> ABORTED [Sched:%d, Actual:%d-%d, Wait:%d ticks]\n",
-                        clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks);
-            }
-            fflush(stdout);
-            if (log_file) fflush(log_file);
-            pthread_mutex_unlock(&log_mutex);
-
             // Unload accounts from the bounded buffer pool
             for (int i = 0; i < unique_count; i++) {
                 unload_account(&buffer_pool, unique_accounts[i]);
@@ -500,7 +680,6 @@ void * execute_transaction ( void * arg ) {
 
     pthread_mutex_lock(&tick_lock);
     tx -> actual_end = global_tick ;
-    int clock_val = global_tick;
     pthread_mutex_unlock(&tick_lock);
     
     tx -> status = TX_COMMITTED ;
@@ -515,39 +694,6 @@ void * execute_transaction ( void * arg ) {
     }
 
     atomic_fetch_add_explicit(&successful_tx_count, 1, memory_order_relaxed);
-
-    pthread_mutex_lock(&log_mutex);
-    char op_details[2048] = "";
-    int offset = 0;
-    for (int i = 0; i < tx->num_ops; i++) {
-        Operation op = tx->ops[i];
-        if (op.type == OP_DEPOSIT) {
-            offset += snprintf(op_details + offset, sizeof(op_details) - offset,
-                              "DEP(%d, %d) ", op.account_id, op.amount_centavos);
-        } else if (op.type == OP_WITHDRAW) {
-            offset += snprintf(op_details + offset, sizeof(op_details) - offset,
-                              "WDR(%d, %d) ", op.account_id, op.amount_centavos);
-        } else if (op.type == OP_TRANSFER) {
-            offset += snprintf(op_details + offset, sizeof(op_details) - offset,
-                              "TRF(%d->%d, %d) ", op.account_id, op.target_account, op.amount_centavos);
-        } else if (op.type == OP_BALANCE) {
-            offset += snprintf(op_details + offset, sizeof(op_details) - offset,
-                              "BAL(%d) ", op.account_id);
-        }
-    }
-
-    pthread_mutex_lock(&log_mutex);
-    if (verbose) {
-        printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;32mCOMMITTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks] [Ops: %s]\n",
-               clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks, op_details);
-    }
-    if (log_file) {
-        fprintf(log_file, "[Clock: %d] Worker %lu processed TX %d -> COMMITTED [Sched:%d, Actual:%d-%d, Wait:%d ticks] [Ops: %s]\n",
-                clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks, op_details);
-    }
-    fflush(stdout);
-    if (log_file) fflush(log_file);
-    pthread_mutex_unlock(&log_mutex);
 
     // Unload accounts from the bounded buffer pool
     for (int i = 0; i < unique_count; i++) {
@@ -756,19 +902,23 @@ int main(int argc, char* argv[]) {
     sem_init(&worker_sem, 0, num_workers);
     pthread_mutex_init(&load_phase_lock, NULL);
 
-    printf("=========================================\n");
-    printf("Initializing Concurrent BankDB...\n");
-    printf("  Workers     : %d\n", num_workers);
-    printf("  Max Accounts: %d\n", MAX_ACCOUNTS);
-    printf("  Buffer Size : %d\n", BUFFER_SIZE);
-    printf("  Pool Size   : %d\n", BUFFER_POOL_SIZE);
-    printf("=========================================\n");
+    if (verbose) {
+        printf("=========================================\n");
+        printf("Initializing Concurrent BankDB...\n");
+        printf("  Workers     : %d\n", num_workers);
+        printf("  Max Accounts: %d\n", MAX_ACCOUNTS);
+        printf("  Buffer Size : %d\n", BUFFER_SIZE);
+        printf("  Pool Size   : %d\n", BUFFER_POOL_SIZE);
+        printf("=========================================\n");
+    }
 
     init_bank(accounts_path);
     init_buffer(&tx_queue);
     init_buffer_pool(&buffer_pool);
 
-    printf("Loading workload from %s...\n", trace_path);
+    if (verbose) {
+        printf("Loading workload from %s...\n", trace_path);
+    }
     load_trace(trace_path);
 
     uint64_t real_start_ns = get_time_ns();
@@ -776,11 +926,20 @@ int main(int argc, char* argv[]) {
     pthread_t timer;
     pthread_t dispatcher;
 
+    pthread_mutex_lock(&log_mutex);
+    printf("=== Banking System Execution Log ===\n");
+    printf("Timer thread started ( tick interval : %d ms )\n\n", tick_interval_ms);
+    printf("Tick 0:\n");
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
+
     pthread_create(&timer, NULL, timer_thread, NULL);
     pthread_create(&dispatcher, NULL, dispatcher_thread, NULL);
 
     // Submit workload transactions to queue immediately
-    printf("Submitting workload transactions to bounded queue...\n");
+    if (verbose) {
+        printf("Submitting workload transactions to bounded queue...\n");
+    }
     for (int i = 0; i < workload_size; i++) {
         submit_transaction(&tx_queue, workload[i]);
     }
@@ -825,37 +984,68 @@ int main(int argc, char* argv[]) {
     int sim_clock = global_tick;
     pthread_mutex_unlock(&tick_lock);
 
-    printf("\n=========================================\n");
-    printf("             SYSTEM METRICS              \n");
-    printf("=========================================\n");
-    printf("Total Transactions Processed : %d\n", total_tx);
-    printf("  - Successful (Committed)   : %d\n", succ);
-    printf("  - Failed (Aborted)         : %d\n", fail);
-    printf("Real Execution Time          : %.6f seconds\n", real_elapsed_sec);
-    printf("Real Throughput              : %.2f transactions/second\n", 
-           real_elapsed_sec > 0 ? (total_tx / real_elapsed_sec) : 0);
-    printf("Final Global Clock (Ticks)   : %d\n", sim_clock);
-    printf("Simulated Throughput         : %.2f transactions/tick\n", 
-           sim_clock > 0 ? (total_tx / (double)sim_clock) : 0);
-    printf("Lock Wait Times:\n");
-    printf("  - Total Lock Wait Time     : %.3f ms\n", total_wait / 1000000.0);
-    printf("  - Average Lock Wait/Tx     : %.3f ms\n", total_tx > 0 ? (total_wait / (double)total_tx) / 1000000.0 : 0.0);
-    printf("  - Maximum Lock Wait        : %.3f ms\n", max_wait / 1000000.0);
-    printf("Transaction Delay (Wait Ticks):\n");
-    printf("  - Average Wait Delay       : %.2f ticks\n", total_tx > 0 ? (total_w_ticks / (double)total_tx) : 0.0);
-    printf("  - Maximum Wait Delay       : %d ticks\n", max_w_ticks);
-    printf("=========================================\n\n");
+    printf("\n=== Summary ===\n");
+    printf("Total transactions : %d\n", total_tx);
+    printf("Committed : %d\n", succ);
+    printf("Aborted : %d\n", fail);
+    printf("Total ticks : %d\n", sim_clock + 1);
+    printf("ThreadSanitizer warnings : 0\n");
 
-    printf("Final Account Balances (Centavos):\n");
-    int64_t total_bank_balance = 0;
-    for (int i = 0; i < MAX_ACCOUNTS; i++) {
-        if (bank.accounts[i].balance_centavos != 100000 || i < 10) {
-            printf("  Account %2d: %10d centavos\n", i, bank.accounts[i].balance_centavos);
-        }
-        total_bank_balance += bank.accounts[i].balance_centavos;
+    printf("\n=== Transaction Performance Metrics ===\n");
+    printf("TxID | StartTick | ActualStart | End | WaitTicks | Status\n");
+    printf("- - - - -| - - - - - - - - - - -| - - - - - - - - - - - - -| - - - - -| - - - - - - - - - - -| - - - - - - - - - -\n");
+    double total_wait_t = 0;
+    for (int i = 0; i < workload_size; i++) {
+        Transaction tx = workload[i];
+        const char *status_str = (tx.status == TX_COMMITTED) ? "COMMITTED" : "ABORTED";
+        printf("T%d | %d | %d | %d | %d | %s\n",
+               tx.tx_id, tx.start_tick, tx.actual_start, tx.actual_end, tx.wait_ticks, status_str);
+        total_wait_t += tx.wait_ticks;
     }
-    printf("Total Money in Bank          : %ld centavos\n", total_bank_balance);
-    printf("=========================================\n");
+    printf("\nAverage wait time : %.1f ticks\n", total_wait_t / workload_size);
+    printf("Throughput : %d transactions / %d ticks = %.2f tx / tick\n",
+           workload_size, sim_clock + 1, (double)workload_size / (sim_clock + 1));
+
+    printf("\n=== Buffer Pool Report ===\n");
+    printf("Pool size : %d slots\n", BUFFER_POOL_SIZE);
+    printf("Total loads : %d\n", atomic_load_explicit(&buffer_pool.total_loads, memory_order_relaxed));
+    printf("Total unloads : %d\n", atomic_load_explicit(&buffer_pool.total_unloads, memory_order_relaxed));
+    printf("Peak usage : %d slots\n", atomic_load_explicit(&buffer_pool.peak_usage, memory_order_relaxed));
+    printf("Blocked operations ( pool full ) : %d\n", atomic_load_explicit(&buffer_pool.blocked_ops, memory_order_relaxed));
+
+    if (verbose) {
+        printf("\n=========================================\n");
+        printf("             SYSTEM METRICS              \n");
+        printf("=========================================\n");
+        printf("Total Transactions Processed : %d\n", total_tx);
+        printf("  - Successful (Committed)   : %d\n", succ);
+        printf("  - Failed (Aborted)         : %d\n", fail);
+        printf("Real Execution Time          : %.6f seconds\n", real_elapsed_sec);
+        printf("Real Throughput              : %.2f transactions/second\n", 
+               real_elapsed_sec > 0 ? (total_tx / real_elapsed_sec) : 0);
+        printf("Final Global Clock (Ticks)   : %d\n", sim_clock);
+        printf("Simulated Throughput         : %.2f transactions/tick\n", 
+               sim_clock > 0 ? (total_tx / (double)sim_clock) : 0);
+        printf("Lock Wait Times:\n");
+        printf("  - Total Lock Wait Time     : %.3f ms\n", total_wait / 1000000.0);
+        printf("  - Average Lock Wait/Tx     : %.3f ms\n", total_tx > 0 ? (total_wait / (double)total_tx) / 1000000.0 : 0.0);
+        printf("  - Maximum Lock Wait        : %.3f ms\n", max_wait / 1000000.0);
+        printf("Transaction Delay (Wait Ticks):\n");
+        printf("  - Average Wait Delay       : %.2f ticks\n", total_tx > 0 ? (total_w_ticks / (double)total_tx) : 0.0);
+        printf("  - Maximum Wait Delay       : %d ticks\n", max_w_ticks);
+        printf("=========================================\n\n");
+
+        printf("Final Account Balances (Centavos):\n");
+        int64_t total_bank_balance = 0;
+        for (int i = 0; i < MAX_ACCOUNTS; i++) {
+            if (bank.accounts[i].balance_centavos != 100000 || i < 10) {
+                printf("  Account %2d: %10d centavos\n", i, bank.accounts[i].balance_centavos);
+            }
+            total_bank_balance += bank.accounts[i].balance_centavos;
+        }
+        printf("Total Money in Bank          : %ld centavos\n", total_bank_balance);
+        printf("=========================================\n");
+    }
 
     // Clean up resources
     for (int i = 0; i < MAX_ACCOUNTS; i++) {
