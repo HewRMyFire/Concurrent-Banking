@@ -1,0 +1,19 @@
+# Simple workload trace
+# Format:
+# TX <tx_id> <num_ops> <start_tick>
+# Followed by <num_ops> operations:
+#   DEPOSIT <account_id> <amount>
+#   WITHDRAW <account_id> <amount>
+#   TRANSFER <from_account> <to_account> <amount>
+#   BALANCE <account_id>
+
+TX 100 2 0
+DEPOSIT 0 500000
+DEPOSIT 1 500000
+
+TX 101 2 2
+TRANSFER 0 1 100000
+BALANCE 0
+
+TX 102 1 4
+WITHDRAW 1 50000
