@@ -89,6 +89,11 @@ typedef struct {
     sem_t empty_slots ;
     sem_t full_slots ;
     pthread_mutex_t pool_lock ;
+    _Atomic int total_loads ;
+    _Atomic int total_unloads ;
+    _Atomic int current_usage ;
+    _Atomic int peak_usage ;
+    _Atomic int blocked_ops ;
 } BufferPool ;
 
 // Globals
@@ -174,6 +179,11 @@ void init_buffer_pool ( BufferPool * pool ) {
     sem_init (& pool -> empty_slots , 0 , BUFFER_POOL_SIZE ) ;
     sem_init (& pool -> full_slots , 0 , 0) ;
     pthread_mutex_init (& pool -> pool_lock , NULL ) ;
+    atomic_store_explicit(& pool -> total_loads, 0, memory_order_relaxed);
+    atomic_store_explicit(& pool -> total_unloads, 0, memory_order_relaxed);
+    atomic_store_explicit(& pool -> current_usage, 0, memory_order_relaxed);
+    atomic_store_explicit(& pool -> peak_usage, 0, memory_order_relaxed);
+    atomic_store_explicit(& pool -> blocked_ops, 0, memory_order_relaxed);
     for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
         pool->slots[i].in_use = false;
         pool->slots[i].account_id = -1;
@@ -189,7 +199,11 @@ void destroy_buffer_pool(BufferPool* pool) {
 
 // Load account into buffer pool ( producer )
 void load_account ( BufferPool * pool , int account_id ) {
-    sem_wait (& pool -> empty_slots ) ; // Wait for empty slot
+    // Try non-blocking first to detect pool-full blocks
+    if (sem_trywait (& pool -> empty_slots ) != 0) {
+        atomic_fetch_add_explicit(& pool -> blocked_ops, 1, memory_order_relaxed);
+        sem_wait (& pool -> empty_slots ) ; // Block until slot available
+    }
 
     pthread_mutex_lock (& pool -> pool_lock ) ;
 
@@ -200,6 +214,17 @@ void load_account ( BufferPool * pool , int account_id ) {
             pool -> slots [ i ]. data = & bank . accounts [ account_id ];
             pool -> slots [ i ]. in_use = true ;
             break ;
+        }
+    }
+
+    // Update stats
+    atomic_fetch_add_explicit(& pool -> total_loads, 1, memory_order_relaxed);
+    int usage = atomic_fetch_add_explicit(& pool -> current_usage, 1, memory_order_relaxed) + 1;
+    int cur_peak = atomic_load_explicit(& pool -> peak_usage, memory_order_relaxed);
+    while (usage > cur_peak) {
+        if (atomic_compare_exchange_weak_explicit(& pool -> peak_usage, & cur_peak, usage,
+                                                  memory_order_relaxed, memory_order_relaxed)) {
+            break;
         }
     }
 
@@ -223,6 +248,10 @@ void unload_account ( BufferPool * pool , int account_id ) {
             break ;
         }
     }
+
+    // Update stats
+    atomic_fetch_add_explicit(& pool -> total_unloads, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(& pool -> current_usage, 1, memory_order_relaxed);
 
     pthread_mutex_unlock (& pool -> pool_lock ) ;
 
@@ -976,6 +1005,13 @@ int main(int argc, char* argv[]) {
     printf("\nAverage wait time : %.1f ticks\n", total_wait_t / workload_size);
     printf("Throughput : %d transactions / %d ticks = %.2f tx / tick\n",
            workload_size, sim_clock + 1, (double)workload_size / (sim_clock + 1));
+
+    printf("\n=== Buffer Pool Report ===\n");
+    printf("Pool size : %d slots\n", BUFFER_POOL_SIZE);
+    printf("Total loads : %d\n", atomic_load_explicit(&buffer_pool.total_loads, memory_order_relaxed));
+    printf("Total unloads : %d\n", atomic_load_explicit(&buffer_pool.total_unloads, memory_order_relaxed));
+    printf("Peak usage : %d slots\n", atomic_load_explicit(&buffer_pool.peak_usage, memory_order_relaxed));
+    printf("Blocked operations ( pool full ) : %d\n", atomic_load_explicit(&buffer_pool.blocked_ops, memory_order_relaxed));
 
     if (verbose) {
         printf("\n=========================================\n");
