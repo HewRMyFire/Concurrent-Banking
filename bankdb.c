@@ -578,14 +578,40 @@ void* dispatcher_thread(void* arg) {
     return NULL;
 }
 
-void init_bank() {
+void init_bank(const char* accounts_filepath) {
     pthread_mutex_init(&bank.bank_lock, NULL);
     bank.num_accounts = MAX_ACCOUNTS;
     for (int i = 0; i < MAX_ACCOUNTS; i++) {
         bank.accounts[i].account_id = i;
-        bank.accounts[i].balance_centavos = 100000; // Default initial balance: 100,000 centavos ($1,000.00)
+        bank.accounts[i].balance_centavos = 0; // Initialize to 0
         pthread_rwlock_init(&bank.accounts[i].lock, NULL);
     }
+
+    FILE* file = fopen(accounts_filepath, "r");
+    if (!file) {
+        perror("Error opening accounts file");
+        exit(EXIT_FAILURE);
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        char* ptr = line;
+        while (isspace((unsigned char)*ptr)) ptr++;
+        if (*ptr == '\0' || *ptr == '#') continue;
+
+        int account_id = 0;
+        int balance_centavos = 0;
+        if (sscanf(ptr, "%d %d", &account_id, &balance_centavos) == 2) {
+            if (account_id >= 0 && account_id < MAX_ACCOUNTS) {
+                bank.accounts[account_id].balance_centavos = balance_centavos;
+            } else {
+                fprintf(stderr, "Warning: Account ID %d out of bounds (max %d)\n", account_id, MAX_ACCOUNTS);
+            }
+        } else {
+            fprintf(stderr, "Malformatted accounts line: %s\n", line);
+        }
+    }
+    fclose(file);
 }
 
 void load_trace(const char* filepath) {
@@ -679,15 +705,16 @@ void load_trace(const char* filepath) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <trace_file_path> [num_workers]\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <trace_file_path> <accounts_file_path> [num_workers]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     const char* trace_path = argv[1];
+    const char* accounts_path = argv[2];
     int num_workers = NUM_WORKERS;
-    if (argc >= 3) {
-        num_workers = atoi(argv[2]);
+    if (argc >= 4) {
+        num_workers = atoi(argv[3]);
         if (num_workers <= 0) {
             fprintf(stderr, "Error: Invalid number of workers specified. Using default (%d).\n", NUM_WORKERS);
             num_workers = NUM_WORKERS;
@@ -713,7 +740,7 @@ int main(int argc, char* argv[]) {
     printf("  Pool Size   : %d\n", BUFFER_POOL_SIZE);
     printf("=========================================\n");
 
-    init_bank();
+    init_bank(accounts_path);
     init_buffer(&tx_queue);
     init_buffer_pool(&buffer_pool);
 
