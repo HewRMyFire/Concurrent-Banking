@@ -210,20 +210,18 @@ bool withdraw ( int account_id , int amount_centavos ) {
 }
 
 bool transfer ( int from_id , int to_id , int amount_centavos ) {
-    if (from_id == to_id) {
-        return true;
-    }
-
-    // Acquire locks in consistent order to prevent deadlock
-    int first = ( from_id < to_id ) ? from_id : to_id ;
-    int second = ( from_id < to_id ) ? to_id : from_id ;
-
-    Account * acc_first = & bank . accounts [ first ];
-    Account * acc_second = & bank . accounts [ second ];
+    // This is where deadlock can occur! Sorted lock acquisition is used to prevent it.
+    Account* acc_from = &bank.accounts[from_id];
+    Account* acc_to = &bank.accounts[to_id];
 
     uint64_t start_wait = get_time_ns();
-    pthread_rwlock_wrlock (& acc_first -> lock ) ;
-    pthread_rwlock_wrlock (& acc_second -> lock ) ;
+    if (from_id < to_id) {
+        pthread_rwlock_wrlock(&acc_from->lock);
+        pthread_rwlock_wrlock(&acc_to->lock);
+    } else {
+        pthread_rwlock_wrlock(&acc_to->lock);
+        pthread_rwlock_wrlock(&acc_from->lock);
+    }
     uint64_t end_wait = get_time_ns();
     uint64_t tx_wait_ns = end_wait - start_wait;
     
@@ -236,21 +234,18 @@ bool transfer ( int from_id , int to_id , int amount_centavos ) {
         }
     }
 
-    // Check sufficient funds
-    Account * from_acc = & bank . accounts [ from_id ];
-    if ( from_acc -> balance_centavos < amount_centavos ) {
-        pthread_rwlock_unlock (& acc_second -> lock ) ;
-        pthread_rwlock_unlock (& acc_first -> lock ) ;
-        return false ;
+    if (acc_from->balance_centavos < amount_centavos) {
+        pthread_rwlock_unlock(&acc_to->lock);
+        pthread_rwlock_unlock(&acc_from->lock);
+        return false;
     }
 
-    // Perform transfer
-    bank . accounts [ from_id ]. balance_centavos -= amount_centavos ;
-    bank . accounts [ to_id ]. balance_centavos += amount_centavos ;
+    acc_from->balance_centavos -= amount_centavos;
+    acc_to->balance_centavos += amount_centavos;
 
-    pthread_rwlock_unlock (& acc_second -> lock ) ;
-    pthread_rwlock_unlock (& acc_first -> lock ) ;
-    return true ;
+    pthread_rwlock_unlock(&acc_to->lock);
+    pthread_rwlock_unlock(&acc_from->lock);
+    return true;
 }
 
 void * execute_transaction ( void * arg ) {
