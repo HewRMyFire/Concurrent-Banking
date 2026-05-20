@@ -1,31 +1,12 @@
-T300 started : DEPOSIT account 0 amount PHP 1000.00
-T300 completed : DEPOSIT successful
-T300 started : DEPOSIT account 1 amount PHP 1000.00
-T302 started : TRANSFER from 1 to 0 amount PHP 300.00
-T302 acquired lock on account 1
-[ DEADLOCK PREVENTED ] Lock ordering : T302 waiting for account 0
-T300 completed : DEPOSIT successful
-T300 started : DEPOSIT account 2 amount PHP 1000.00
-T302 completed : TRANSFER successful
-T300 completed : DEPOSIT successful
-T301 started : TRANSFER from 0 to 1 amount PHP 500.00
-T301 acquired lock on account 0
-T303 started : DEPOSIT account 2 amount PHP 2000.00
-T304 started : BALANCE account 2
-T304 : Account 2 balance = PHP 3000.00
-T301 completed : TRANSFER successful
-T303 completed : DEPOSIT successful
-T303 started : WITHDRAW account 2 amount PHP 5000.00
-T305 started : DEPOSIT account 8 amount PHP 1000.00
-T303 completed : WITHDRAW failed
-T305 completed : DEPOSIT successful
-T305 started : DEPOSIT account 9 amount PHP 1000.00
-T306 started : TRANSFER from 8 to 9 amount PHP 200.00
-T306 acquired lock on account 8
-[ DEADLOCK PREVENTED ] Lock ordering : T306 waiting for account 9
-T305 completed : DEPOSIT successful
-T307 started : TRANSFER from 9 to 8 amount PHP 400.00
-T307 acquired lock on account 9
-[ DEADLOCK PREVENTED ] Lock ordering : T307 waiting for account 8
-T306 completed : TRANSFER successful
-T307 completed : TRANSFER successful
+T1 started : DEPOSIT account 1 amount PHP 10.00
+T2 started : DEPOSIT account 2 amount PHP 10.00
+T3 started : DEPOSIT account 3 amount PHP 10.00
+T4 started : DEPOSIT account 4 amount PHP 10.00
+T5 started : DEPOSIT account 5 amount PHP 10.00
+T5 completed : DEPOSIT successful
+T1 completed : DEPOSIT successful
+T2 completed : DEPOSIT successful
+T3 completed : DEPOSIT successful
+T4 completed : DEPOSIT successful
+T6 started : DEPOSIT account 6 amount PHP 10.00
+T6 completed : DEPOSIT successful
