@@ -18,7 +18,6 @@
 #define BUFFER_SIZE 50
 #define NUM_WORKERS 4
 #define MAX_WORKLOAD_SIZE 10000
-#define TICK_INTERVAL_MS 10
 #define BUFFER_POOL_SIZE 5
 
 typedef enum {
@@ -109,6 +108,8 @@ _Atomic bool simulation_running = true;
 
 sem_t worker_sem;
 pthread_mutex_t load_phase_lock;
+int tick_interval_ms = 100;
+bool verbose = false;
 
 _Atomic uint64_t total_lock_wait_ns = 0;
 _Atomic uint64_t max_lock_wait_ns = 0;
@@ -228,12 +229,12 @@ void unload_account ( BufferPool * pool , int account_id ) {
     sem_post (& pool -> empty_slots ) ; // Signal slot is empty
 }
 
-// Timer thread increments clock every TICK_INTERVAL_MS
+// Timer thread increments clock every tick_interval_ms
 void * timer_thread ( void * arg ) {
     (void)arg;
     while ( simulation_running ) {
         pthread_mutex_lock (& tick_lock ) ;
-        usleep ( TICK_INTERVAL_MS * 1000) ; // Sleep to simulate a tick
+        usleep ( tick_interval_ms * 1000) ; // Sleep to simulate a tick
         global_tick ++;
         pthread_cond_broadcast (& tick_changed ) ; // Wake waiting
         pthread_mutex_unlock (& tick_lock ) ;
@@ -475,8 +476,10 @@ void * execute_transaction ( void * arg ) {
             atomic_fetch_add_explicit(&failed_tx_count, 1, memory_order_relaxed);
 
             pthread_mutex_lock(&log_mutex);
-            printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;31mABORTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks]\n",
-                   clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks);
+            if (verbose) {
+                printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;31mABORTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks]\n",
+                       clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks);
+            }
             if (log_file) {
                 fprintf(log_file, "[Clock: %d] Worker %lu processed TX %d -> ABORTED [Sched:%d, Actual:%d-%d, Wait:%d ticks]\n",
                         clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks);
@@ -533,8 +536,11 @@ void * execute_transaction ( void * arg ) {
         }
     }
 
-    printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;32mCOMMITTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks] [Ops: %s]\n",
-           clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks, op_details);
+    pthread_mutex_lock(&log_mutex);
+    if (verbose) {
+        printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;32mCOMMITTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks] [Ops: %s]\n",
+               clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks, op_details);
+    }
     if (log_file) {
         fprintf(log_file, "[Clock: %d] Worker %lu processed TX %d -> COMMITTED [Sched:%d, Actual:%d-%d, Wait:%d ticks] [Ops: %s]\n",
                 clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks, op_details);
@@ -578,14 +584,40 @@ void* dispatcher_thread(void* arg) {
     return NULL;
 }
 
-void init_bank() {
+void init_bank(const char* accounts_filepath) {
     pthread_mutex_init(&bank.bank_lock, NULL);
     bank.num_accounts = MAX_ACCOUNTS;
     for (int i = 0; i < MAX_ACCOUNTS; i++) {
         bank.accounts[i].account_id = i;
-        bank.accounts[i].balance_centavos = 100000; // Default initial balance: 100,000 centavos ($1,000.00)
+        bank.accounts[i].balance_centavos = 0; // Initialize to 0
         pthread_rwlock_init(&bank.accounts[i].lock, NULL);
     }
+
+    FILE* file = fopen(accounts_filepath, "r");
+    if (!file) {
+        perror("Error opening accounts file");
+        exit(EXIT_FAILURE);
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        char* ptr = line;
+        while (isspace((unsigned char)*ptr)) ptr++;
+        if (*ptr == '\0' || *ptr == '#') continue;
+
+        int account_id = 0;
+        int balance_centavos = 0;
+        if (sscanf(ptr, "%d %d", &account_id, &balance_centavos) == 2) {
+            if (account_id >= 0 && account_id < MAX_ACCOUNTS) {
+                bank.accounts[account_id].balance_centavos = balance_centavos;
+            } else {
+                fprintf(stderr, "Warning: Account ID %d out of bounds (max %d)\n", account_id, MAX_ACCOUNTS);
+            }
+        } else {
+            fprintf(stderr, "Malformatted accounts line: %s\n", line);
+        }
+    }
+    fclose(file);
 }
 
 void load_trace(const char* filepath) {
@@ -602,70 +634,76 @@ void load_trace(const char* filepath) {
         if (*ptr == '\0' || *ptr == '#') continue;
 
         int tx_id = 0;
-        int num_ops = 0;
         int start_tick = 0;
-        if (sscanf(ptr, "TX %d %d %d", &tx_id, &num_ops, &start_tick) == 3) {
-            if (workload_size >= MAX_WORKLOAD_SIZE) {
-                fprintf(stderr, "Workload limit reached (%d)\n", MAX_WORKLOAD_SIZE);
-                break;
+        char op_name[32];
+        if (sscanf(ptr, "T%d %d %31s", &tx_id, &start_tick, op_name) == 3) {
+            Operation op;
+            memset(&op, 0, sizeof(op));
+            bool op_valid = false;
+
+            if (strcmp(op_name, "DEPOSIT") == 0) {
+                op.type = OP_DEPOSIT;
+                if (sscanf(ptr, "T%*d %*d %*s %d %d", &op.account_id, &op.amount_centavos) == 2) {
+                    op_valid = true;
+                }
+            } else if (strcmp(op_name, "WITHDRAW") == 0) {
+                op.type = OP_WITHDRAW;
+                if (sscanf(ptr, "T%*d %*d %*s %d %d", &op.account_id, &op.amount_centavos) == 2) {
+                    op_valid = true;
+                }
+            } else if (strcmp(op_name, "TRANSFER") == 0) {
+                op.type = OP_TRANSFER;
+                if (sscanf(ptr, "T%*d %*d %*s %d %d %d", &op.account_id, &op.target_account, &op.amount_centavos) == 3) {
+                    op_valid = true;
+                }
+            } else if (strcmp(op_name, "BALANCE") == 0) {
+                op.type = OP_BALANCE;
+                if (sscanf(ptr, "T%*d %*d %*s %d", &op.account_id) == 1) {
+                    op_valid = true;
+                }
+            } else {
+                fprintf(stderr, "Unknown operation: %s\n", op_name);
             }
 
-            Transaction* tx = &workload[workload_size];
-            tx->tx_id = tx_id;
-            tx->num_ops = 0;
-            tx->start_tick = start_tick;
-            tx->status = TX_RUNNING;
-
-            if (num_ops > 256) {
-                fprintf(stderr, "Warning: TX %d has %d operations (max 256). Truncating.\n", tx_id, num_ops);
-                num_ops = 256;
-            }
-
-            for (int i = 0; i < num_ops; i++) {
-                char op_line[256];
-                bool op_read = false;
-                while (fgets(op_line, sizeof(op_line), file)) {
-                    char* op_ptr = op_line;
-                    while (isspace((unsigned char)*op_ptr)) op_ptr++;
-                    if (*op_ptr == '\0' || *op_ptr == '#') continue;
-
-                    char op_name[32];
-                    Operation op;
-                    memset(&op, 0, sizeof(op));
-
-                    if (sscanf(op_ptr, "%31s", op_name) == 1) {
-                        if (strcmp(op_name, "DEPOSIT") == 0) {
-                            op.type = OP_DEPOSIT;
-                            if (sscanf(op_ptr, "DEPOSIT %d %d", &op.account_id, &op.amount_centavos) == 2) {
-                                tx->ops[tx->num_ops++] = op;
-                                op_read = true;
-                            }
-                        } else if (strcmp(op_name, "WITHDRAW") == 0) {
-                            op.type = OP_WITHDRAW;
-                            if (sscanf(op_ptr, "WITHDRAW %d %d", &op.account_id, &op.amount_centavos) == 2) {
-                                tx->ops[tx->num_ops++] = op;
-                                op_read = true;
-                            }
-                        } else if (strcmp(op_name, "TRANSFER") == 0) {
-                            op.type = OP_TRANSFER;
-                            if (sscanf(op_ptr, "TRANSFER %d %d %d", &op.account_id, &op.target_account, &op.amount_centavos) == 3) {
-                                tx->ops[tx->num_ops++] = op;
-                                op_read = true;
-                            }
-                        } else if (strcmp(op_name, "BALANCE") == 0) {
-                            op.type = OP_BALANCE;
-                            if (sscanf(op_ptr, "BALANCE %d", &op.account_id) == 1) {
-                                tx->ops[tx->num_ops++] = op;
-                                op_read = true;
-                            }
-                        } else {
-                            fprintf(stderr, "Unknown operation: %s\n", op_name);
-                        }
+            if (op_valid) {
+                // Find if transaction tx_id already exists in workload
+                int idx = -1;
+                for (int i = 0; i < workload_size; i++) {
+                    if (workload[i].tx_id == tx_id) {
+                        idx = i;
+                        break;
                     }
-                    if (op_read) break;
+                }
+
+                if (idx != -1) {
+                    // Transaction exists, append operation if we have space
+                    Transaction* tx = &workload[idx];
+                    if (tx->num_ops < 256) {
+                        tx->ops[tx->num_ops++] = op;
+                    } else {
+                        fprintf(stderr, "Warning: TX %d exceeded max operation count (256). Operation ignored.\n", tx_id);
+                    }
+                } else {
+                    // Create new transaction
+                    if (workload_size >= MAX_WORKLOAD_SIZE) {
+                        fprintf(stderr, "Workload limit reached (%d)\n", MAX_WORKLOAD_SIZE);
+                        break;
+                    }
+                    Transaction* tx = &workload[workload_size];
+                    tx->tx_id = tx_id;
+                    tx->start_tick = start_tick;
+                    tx->ops[0] = op;
+                    tx->num_ops = 1;
+                    tx->status = TX_RUNNING;
+                    tx->thread = 0;
+                    tx->actual_start = 0;
+                    tx->actual_end = 0;
+                    tx->wait_ticks = 0;
+                    workload_size++;
                 }
             }
-            workload_size++;
+        } else {
+            fprintf(stderr, "Malformatted trace line: %s\n", line);
         }
     }
 
@@ -673,19 +711,38 @@ void load_trace(const char* filepath) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <trace_file_path> [num_workers]\n", argv[0]);
+    const char* accounts_path = NULL;
+    const char* trace_path = NULL;
+    const char* deadlock_strategy = NULL;
+    int num_workers = NUM_WORKERS;
+
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--accounts=", 11) == 0) {
+            accounts_path = argv[i] + 11;
+        } else if (strncmp(argv[i], "--trace=", 8) == 0) {
+            trace_path = argv[i] + 8;
+        } else if (strncmp(argv[i], "--deadlock=", 11) == 0) {
+            deadlock_strategy = argv[i] + 11;
+        } else if (strncmp(argv[i], "--tick-ms=", 10) == 0) {
+            tick_interval_ms = atoi(argv[i] + 10);
+        } else if (strcmp(argv[i], "--verbose") == 0) {
+            verbose = true;
+        } else if (strncmp(argv[i], "--workers=", 10) == 0) {
+            num_workers = atoi(argv[i] + 10);
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (!accounts_path || !trace_path || !deadlock_strategy) {
+        fprintf(stderr, "Usage: %s --accounts=FILE --trace=FILE --deadlock=prevention|detection [--tick-ms=N] [--verbose]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    const char* trace_path = argv[1];
-    int num_workers = NUM_WORKERS;
-    if (argc >= 3) {
-        num_workers = atoi(argv[2]);
-        if (num_workers <= 0) {
-            fprintf(stderr, "Error: Invalid number of workers specified. Using default (%d).\n", NUM_WORKERS);
-            num_workers = NUM_WORKERS;
-        }
+    if (strcmp(deadlock_strategy, "prevention") != 0) {
+        fprintf(stderr, "Error: Only 'prevention' deadlock strategy is supported.\n");
+        return EXIT_FAILURE;
     }
 
     log_file = fopen("bankdb.log", "w");
@@ -707,7 +764,7 @@ int main(int argc, char* argv[]) {
     printf("  Pool Size   : %d\n", BUFFER_POOL_SIZE);
     printf("=========================================\n");
 
-    init_bank();
+    init_bank(accounts_path);
     init_buffer(&tx_queue);
     init_buffer_pool(&buffer_pool);
 
