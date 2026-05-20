@@ -18,7 +18,6 @@
 #define BUFFER_SIZE 50
 #define NUM_WORKERS 4
 #define MAX_WORKLOAD_SIZE 10000
-#define TICK_INTERVAL_MS 10
 #define BUFFER_POOL_SIZE 5
 
 typedef enum {
@@ -109,6 +108,8 @@ _Atomic bool simulation_running = true;
 
 sem_t worker_sem;
 pthread_mutex_t load_phase_lock;
+int tick_interval_ms = 100;
+bool verbose = false;
 
 _Atomic uint64_t total_lock_wait_ns = 0;
 _Atomic uint64_t max_lock_wait_ns = 0;
@@ -228,12 +229,12 @@ void unload_account ( BufferPool * pool , int account_id ) {
     sem_post (& pool -> empty_slots ) ; // Signal slot is empty
 }
 
-// Timer thread increments clock every TICK_INTERVAL_MS
+// Timer thread increments clock every tick_interval_ms
 void * timer_thread ( void * arg ) {
     (void)arg;
     while ( simulation_running ) {
         pthread_mutex_lock (& tick_lock ) ;
-        usleep ( TICK_INTERVAL_MS * 1000) ; // Sleep to simulate a tick
+        usleep ( tick_interval_ms * 1000) ; // Sleep to simulate a tick
         global_tick ++;
         pthread_cond_broadcast (& tick_changed ) ; // Wake waiting
         pthread_mutex_unlock (& tick_lock ) ;
@@ -475,8 +476,10 @@ void * execute_transaction ( void * arg ) {
             atomic_fetch_add_explicit(&failed_tx_count, 1, memory_order_relaxed);
 
             pthread_mutex_lock(&log_mutex);
-            printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;31mABORTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks]\n",
-                   clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks);
+            if (verbose) {
+                printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;31mABORTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks]\n",
+                       clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks);
+            }
             if (log_file) {
                 fprintf(log_file, "[Clock: %d] Worker %lu processed TX %d -> ABORTED [Sched:%d, Actual:%d-%d, Wait:%d ticks]\n",
                         clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks);
@@ -533,8 +536,11 @@ void * execute_transaction ( void * arg ) {
         }
     }
 
-    printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;32mCOMMITTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks] [Ops: %s]\n",
-           clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks, op_details);
+    pthread_mutex_lock(&log_mutex);
+    if (verbose) {
+        printf("[Clock: %4d] Worker %lu processed TX %3d -> \033[1;32mCOMMITTED\033[0m [Sched:%d, Actual:%d-%d, Wait:%d ticks] [Ops: %s]\n",
+               clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks, op_details);
+    }
     if (log_file) {
         fprintf(log_file, "[Clock: %d] Worker %lu processed TX %d -> COMMITTED [Sched:%d, Actual:%d-%d, Wait:%d ticks] [Ops: %s]\n",
                 clock_val, (unsigned long)pthread_self(), tx->tx_id, tx->start_tick, tx->actual_start, tx->actual_end, tx->wait_ticks, op_details);
@@ -705,20 +711,38 @@ void load_trace(const char* filepath) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <trace_file_path> <accounts_file_path> [num_workers]\n", argv[0]);
+    const char* accounts_path = NULL;
+    const char* trace_path = NULL;
+    const char* deadlock_strategy = NULL;
+    int num_workers = NUM_WORKERS;
+
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--accounts=", 11) == 0) {
+            accounts_path = argv[i] + 11;
+        } else if (strncmp(argv[i], "--trace=", 8) == 0) {
+            trace_path = argv[i] + 8;
+        } else if (strncmp(argv[i], "--deadlock=", 11) == 0) {
+            deadlock_strategy = argv[i] + 11;
+        } else if (strncmp(argv[i], "--tick-ms=", 10) == 0) {
+            tick_interval_ms = atoi(argv[i] + 10);
+        } else if (strcmp(argv[i], "--verbose") == 0) {
+            verbose = true;
+        } else if (strncmp(argv[i], "--workers=", 10) == 0) {
+            num_workers = atoi(argv[i] + 10);
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (!accounts_path || !trace_path || !deadlock_strategy) {
+        fprintf(stderr, "Usage: %s --accounts=FILE --trace=FILE --deadlock=prevention|detection [--tick-ms=N] [--verbose]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    const char* trace_path = argv[1];
-    const char* accounts_path = argv[2];
-    int num_workers = NUM_WORKERS;
-    if (argc >= 4) {
-        num_workers = atoi(argv[3]);
-        if (num_workers <= 0) {
-            fprintf(stderr, "Error: Invalid number of workers specified. Using default (%d).\n", NUM_WORKERS);
-            num_workers = NUM_WORKERS;
-        }
+    if (strcmp(deadlock_strategy, "prevention") != 0) {
+        fprintf(stderr, "Error: Only 'prevention' deadlock strategy is supported.\n");
+        return EXIT_FAILURE;
     }
 
     log_file = fopen("bankdb.log", "w");
