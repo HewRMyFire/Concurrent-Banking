@@ -1,0 +1,3 @@
+# Two transfers in opposite directions
+T1 0 TRANSFER 10 20 5000
+T2 0 TRANSFER 20 10 3000

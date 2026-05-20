@@ -97,6 +97,12 @@ typedef struct {
 } BufferPool ;
 
 // Globals
+const char* deadlock_strategy_global = "prevention";
+pthread_mutex_t deadlock_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t deadlock_cond = PTHREAD_COND_INITIALIZER;
+int owner_tx_idx[MAX_ACCOUNTS];
+int waiting_for[MAX_WORKLOAD_SIZE];
+
 Bank bank;
 BoundedBuffer tx_queue;
 BufferPool buffer_pool;
@@ -317,91 +323,207 @@ bool withdraw ( int account_id , int amount_centavos ) {
     return true ;
 }
 
-bool transfer ( int from_id , int to_id , int amount_centavos, int tx_id ) {
+bool acquire_account_lock(int acc_id, int tx_idx) {
+    if (strcmp(deadlock_strategy_global, "prevention") == 0) {
+        pthread_rwlock_wrlock(&bank.accounts[acc_id].lock);
+        return true;
+    }
+
+    pthread_mutex_lock(&deadlock_lock);
+    while (owner_tx_idx[acc_id] != -1 && owner_tx_idx[acc_id] != tx_idx) {
+        waiting_for[tx_idx] = acc_id;
+
+        // Cycle check:
+        int current_idx = tx_idx;
+        bool cycle = false;
+        while (true) {
+            int needed_acc = waiting_for[current_idx];
+            if (needed_acc == -1) break;
+            int owner_idx = owner_tx_idx[needed_acc];
+            if (owner_idx == -1) break;
+            if (owner_idx == tx_idx) {
+                cycle = true;
+                break;
+            }
+            current_idx = owner_idx;
+        }
+
+        if (cycle) {
+            pthread_mutex_lock(&log_mutex);
+            printf("[ DEADLOCK DETECTED ] Cycle detected: T%d waiting for account %d (owned by T%d). Aborting T%d.\n",
+                   workload[tx_idx].tx_id, acc_id, workload[owner_tx_idx[acc_id]].tx_id, workload[tx_idx].tx_id);
+            if (log_file) {
+                fprintf(log_file, "[ DEADLOCK DETECTED ] Cycle detected: T%d waiting for account %d (owned by T%d). Aborting T%d.\n",
+                        workload[tx_idx].tx_id, acc_id, workload[owner_tx_idx[acc_id]].tx_id, workload[tx_idx].tx_id);
+            }
+            fflush(stdout);
+            if (log_file) fflush(log_file);
+            pthread_mutex_unlock(&log_mutex);
+
+            waiting_for[tx_idx] = -1;
+            pthread_mutex_unlock(&deadlock_lock);
+            return false; // Signal deadlock / abort
+        }
+
+        pthread_cond_wait(&deadlock_cond, &deadlock_lock);
+    }
+
+    owner_tx_idx[acc_id] = tx_idx;
+    waiting_for[tx_idx] = -1;
+    pthread_mutex_unlock(&deadlock_lock);
+
+    pthread_rwlock_wrlock(&bank.accounts[acc_id].lock);
+    return true;
+}
+
+void release_account_lock(int acc_id, int tx_idx) {
+    if (strcmp(deadlock_strategy_global, "prevention") == 0) {
+        pthread_rwlock_unlock(&bank.accounts[acc_id].lock);
+        return;
+    }
+
+    pthread_rwlock_unlock(&bank.accounts[acc_id].lock);
+
+    pthread_mutex_lock(&deadlock_lock);
+    if (owner_tx_idx[acc_id] == tx_idx) {
+        owner_tx_idx[acc_id] = -1;
+        pthread_cond_broadcast(&deadlock_cond);
+    }
+    pthread_mutex_unlock(&deadlock_lock);
+}
+
+bool transfer ( int from_id , int to_id , int amount_centavos, int tx_idx ) {
+    int tx_id = workload[tx_idx].tx_id;
     if (from_id == to_id) {
         return true;
     }
 
-    pthread_mutex_lock(&log_mutex);
-    printf("T%d acquired lock on account %d\n", tx_id, from_id);
-    if (log_file) {
-        fprintf(log_file, "T%d acquired lock on account %d\n", tx_id, from_id);
-    }
-    fflush(stdout);
-    if (log_file) fflush(log_file);
-    pthread_mutex_unlock(&log_mutex);
-
-    // Check if there is a concurrent transaction with symmetric transfer (deadlock potential)
-    bool conflict = false;
-    for (int i = 0; i < workload_size; i++) {
-        if (workload[i].tx_id != tx_id && workload[i].status == TX_RUNNING) {
-            for (int j = 0; j < workload[i].num_ops; j++) {
-                Operation other_op = workload[i].ops[j];
-                if (other_op.type == OP_TRANSFER && 
-                    other_op.account_id == to_id && 
-                    other_op.target_account == from_id) {
-                    conflict = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (conflict) {
+    if (strcmp(deadlock_strategy_global, "prevention") == 0) {
         pthread_mutex_lock(&log_mutex);
-        printf("[ DEADLOCK PREVENTED ] Lock ordering : T%d waiting for account %d\n", tx_id, to_id);
+        printf("T%d acquired lock on account %d\n", tx_id, from_id);
         if (log_file) {
-            fprintf(log_file, "[ DEADLOCK PREVENTED ] Lock ordering : T%d waiting for account %d\n", tx_id, to_id);
+            fprintf(log_file, "T%d acquired lock on account %d\n", tx_id, from_id);
         }
         fflush(stdout);
         if (log_file) fflush(log_file);
         pthread_mutex_unlock(&log_mutex);
 
+        // Check if there is a concurrent transaction with symmetric transfer (deadlock potential)
+        bool conflict = false;
         for (int i = 0; i < workload_size; i++) {
-            if (workload[i].tx_id == tx_id) {
-                workload[i].wait_ticks += 1;
+            if (workload[i].tx_id != tx_id && workload[i].status == TX_RUNNING) {
+                for (int j = 0; j < workload[i].num_ops; j++) {
+                    Operation other_op = workload[i].ops[j];
+                    if (other_op.type == OP_TRANSFER && 
+                        other_op.account_id == to_id && 
+                        other_op.target_account == from_id) {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (conflict) {
+            pthread_mutex_lock(&log_mutex);
+            printf("[ DEADLOCK PREVENTED ] Lock ordering : T%d waiting for account %d\n", tx_id, to_id);
+            if (log_file) {
+                fprintf(log_file, "[ DEADLOCK PREVENTED ] Lock ordering : T%d waiting for account %d\n", tx_id, to_id);
+            }
+            fflush(stdout);
+            if (log_file) fflush(log_file);
+            pthread_mutex_unlock(&log_mutex);
+
+            workload[tx_idx].wait_ticks += 1;
+        }
+
+        // Acquire locks in consistent order to prevent deadlock
+        int first = ( from_id < to_id ) ? from_id : to_id ;
+        int second = ( from_id < to_id ) ? to_id : from_id ;
+
+        Account * acc_first = & bank . accounts [ first ];
+        Account * acc_second = & bank . accounts [ second ];
+
+        uint64_t start_wait = get_time_ns();
+        pthread_rwlock_wrlock (& acc_first -> lock ) ;
+        pthread_rwlock_wrlock (& acc_second -> lock ) ;
+        uint64_t end_wait = get_time_ns();
+        uint64_t tx_wait_ns = end_wait - start_wait;
+        
+        atomic_fetch_add_explicit(&total_lock_wait_ns, tx_wait_ns, memory_order_relaxed);
+        uint64_t cur_max = atomic_load_explicit(&max_lock_wait_ns, memory_order_relaxed);
+        while (tx_wait_ns > cur_max) {
+            if (atomic_compare_exchange_weak_explicit(&max_lock_wait_ns, &cur_max, tx_wait_ns,
+                                                      memory_order_relaxed, memory_order_relaxed)) {
                 break;
             }
         }
-    }
 
-    // Acquire locks in consistent order to prevent deadlock
-    int first = ( from_id < to_id ) ? from_id : to_id ;
-    int second = ( from_id < to_id ) ? to_id : from_id ;
-
-    Account * acc_first = & bank . accounts [ first ];
-    Account * acc_second = & bank . accounts [ second ];
-
-    uint64_t start_wait = get_time_ns();
-    pthread_rwlock_wrlock (& acc_first -> lock ) ;
-    pthread_rwlock_wrlock (& acc_second -> lock ) ;
-    uint64_t end_wait = get_time_ns();
-    uint64_t tx_wait_ns = end_wait - start_wait;
-    
-    atomic_fetch_add_explicit(&total_lock_wait_ns, tx_wait_ns, memory_order_relaxed);
-    uint64_t cur_max = atomic_load_explicit(&max_lock_wait_ns, memory_order_relaxed);
-    while (tx_wait_ns > cur_max) {
-        if (atomic_compare_exchange_weak_explicit(&max_lock_wait_ns, &cur_max, tx_wait_ns,
-                                                  memory_order_relaxed, memory_order_relaxed)) {
-            break;
+        // Check sufficient funds
+        Account * from_acc = & bank . accounts [ from_id ];
+        if ( from_acc -> balance_centavos < amount_centavos ) {
+            pthread_rwlock_unlock (& acc_second -> lock ) ;
+            pthread_rwlock_unlock (& acc_first -> lock ) ;
+            return false ;
         }
-    }
 
-    // Check sufficient funds
-    Account * from_acc = & bank . accounts [ from_id ];
-    if ( from_acc -> balance_centavos < amount_centavos ) {
+        // Perform transfer
+        bank . accounts [ from_id ]. balance_centavos -= amount_centavos ;
+        bank . accounts [ to_id ]. balance_centavos += amount_centavos ;
+
         pthread_rwlock_unlock (& acc_second -> lock ) ;
         pthread_rwlock_unlock (& acc_first -> lock ) ;
-        return false ;
+        return true ;
+    } else {
+        // Detection strategy: naive lock ordering with wait-for graph cycle checking
+        uint64_t start_wait = get_time_ns();
+
+        if (!acquire_account_lock(from_id, tx_idx)) {
+            return false;
+        }
+
+        pthread_mutex_lock(&log_mutex);
+        printf("T%d acquired lock on account %d\n", tx_id, from_id);
+        if (log_file) {
+            fprintf(log_file, "T%d acquired lock on account %d\n", tx_id, from_id);
+        }
+        fflush(stdout);
+        if (log_file) fflush(log_file);
+        pthread_mutex_unlock(&log_mutex);
+
+        if (!acquire_account_lock(to_id, tx_idx)) {
+            release_account_lock(from_id, tx_idx);
+            return false;
+        }
+
+        uint64_t end_wait = get_time_ns();
+        uint64_t tx_wait_ns = end_wait - start_wait;
+        
+        atomic_fetch_add_explicit(&total_lock_wait_ns, tx_wait_ns, memory_order_relaxed);
+        uint64_t cur_max = atomic_load_explicit(&max_lock_wait_ns, memory_order_relaxed);
+        while (tx_wait_ns > cur_max) {
+            if (atomic_compare_exchange_weak_explicit(&max_lock_wait_ns, &cur_max, tx_wait_ns,
+                                                      memory_order_relaxed, memory_order_relaxed)) {
+                break;
+            }
+        }
+
+        // Check sufficient funds
+        Account * from_acc = & bank . accounts [ from_id ];
+        if ( from_acc -> balance_centavos < amount_centavos ) {
+            release_account_lock(to_id, tx_idx);
+            release_account_lock(from_id, tx_idx);
+            return false ;
+        }
+
+        // Perform transfer
+        bank . accounts [ from_id ]. balance_centavos -= amount_centavos ;
+        bank . accounts [ to_id ]. balance_centavos += amount_centavos ;
+
+        release_account_lock(to_id, tx_idx);
+        release_account_lock(from_id, tx_idx);
+        return true ;
     }
-
-    // Perform transfer
-    bank . accounts [ from_id ]. balance_centavos -= amount_centavos ;
-    bank . accounts [ to_id ]. balance_centavos += amount_centavos ;
-
-    pthread_rwlock_unlock (& acc_second -> lock ) ;
-    pthread_rwlock_unlock (& acc_first -> lock ) ;
-    return true ;
 }
 
 void * execute_transaction ( void * arg ) {
@@ -575,7 +697,7 @@ void * execute_transaction ( void * arg ) {
 
         case OP_TRANSFER :
             if (! transfer ( op -> account_id , op -> target_account ,
-                            op -> amount_centavos, tx -> tx_id ) ) {
+                            op -> amount_centavos, tx - workload ) ) {
                 op_success = false;
 
                 pthread_mutex_lock(&tick_lock);
@@ -647,7 +769,7 @@ void * execute_transaction ( void * arg ) {
                 } else if (cop.type == OP_WITHDRAW) {
                     deposit(cop.account_id, cop.amount_centavos);
                 } else if (cop.type == OP_TRANSFER) {
-                    transfer(cop.target_account, cop.account_id, cop.amount_centavos, tx->tx_id);
+                    transfer(cop.target_account, cop.account_id, cop.amount_centavos, tx - workload);
                 }
             }
 
@@ -885,11 +1007,11 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Usage: %s --accounts=FILE --trace=FILE --deadlock=prevention|detection [--tick-ms=N] [--verbose]\n", argv[0]);
         return EXIT_FAILURE;
     }
-
-    if (strcmp(deadlock_strategy, "prevention") != 0) {
-        fprintf(stderr, "Error: Only 'prevention' deadlock strategy is supported.\n");
+    if (strcmp(deadlock_strategy, "prevention") != 0 && strcmp(deadlock_strategy, "detection") != 0) {
+        fprintf(stderr, "Error: Invalid deadlock strategy '%s'. Must be 'prevention' or 'detection'.\n", deadlock_strategy);
         return EXIT_FAILURE;
     }
+    deadlock_strategy_global = deadlock_strategy;
 
     log_file = fopen("bankdb.log", "w");
     if (!log_file) {
@@ -902,6 +1024,12 @@ int main(int argc, char* argv[]) {
     sem_init(&worker_sem, 0, num_workers);
     pthread_mutex_init(&load_phase_lock, NULL);
 
+    for (int i = 0; i < MAX_ACCOUNTS; i++) {
+        owner_tx_idx[i] = -1;
+    }
+    for (int i = 0; i < MAX_WORKLOAD_SIZE; i++) {
+        waiting_for[i] = -1;
+    }
     if (verbose) {
         printf("=========================================\n");
         printf("Initializing Concurrent BankDB...\n");

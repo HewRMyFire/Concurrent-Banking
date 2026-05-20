@@ -1,0 +1,4 @@
+# Single-threaded sequential operations
+T1 0 DEPOSIT 10 10000
+T1 1 WITHDRAW 10 2000
+T1 2 BALANCE 10
