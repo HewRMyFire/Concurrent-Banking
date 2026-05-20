@@ -1,9 +1,32 @@
-[Clock: 1] Worker 140737260799680 processed TX 300 -> COMMITTED [Sched:0, Actual:1-1, Wait:0 ticks] [Ops: DEP(0, 100000) DEP(1, 100000) DEP(2, 100000) ]
-[Clock: 1] Worker 140737252406976 processed TX 301 -> COMMITTED [Sched:1, Actual:1-1, Wait:0 ticks] [Ops: TRF(0->1, 50000) ]
-[Clock: 3] Worker 140737235621568 processed TX 303 -> ABORTED [Sched:2, Actual:2-3, Wait:0 ticks]
-T304: Account 2 balance = PHP 2000 .00
-[Clock: 4] Worker 140737244014272 processed TX 302 -> COMMITTED [Sched:1, Actual:2-4, Wait:2 ticks] [Ops: TRF(1->0, 30000) ]
-[Clock: 4] Worker 140737227228864 processed TX 304 -> COMMITTED [Sched:3, Actual:3-4, Wait:1 ticks] [Ops: BAL(2) ]
-[Clock: 4] Worker 140737218836160 processed TX 305 -> COMMITTED [Sched:4, Actual:4-4, Wait:0 ticks] [Ops: DEP(8, 100000) DEP(9, 100000) ]
-[Clock: 5] Worker 140737210443456 processed TX 306 -> COMMITTED [Sched:5, Actual:5-5, Wait:0 ticks] [Ops: TRF(8->9, 20000) ]
-[Clock: 5] Worker 140737202050752 processed TX 307 -> COMMITTED [Sched:5, Actual:5-5, Wait:0 ticks] [Ops: TRF(9->8, 40000) ]
+T300 started : DEPOSIT account 0 amount PHP 1000.00
+T300 completed : DEPOSIT successful
+T300 started : DEPOSIT account 1 amount PHP 1000.00
+T300 completed : DEPOSIT successful
+T300 started : DEPOSIT account 2 amount PHP 1000.00
+T300 completed : DEPOSIT successful
+T301 started : TRANSFER from 0 to 1 amount PHP 500.00
+T301 acquired lock on account 0
+[ DEADLOCK PREVENTED ] Lock ordering : T301 waiting for account 1
+T302 started : TRANSFER from 1 to 0 amount PHP 300.00
+T302 acquired lock on account 1
+[ DEADLOCK PREVENTED ] Lock ordering : T302 waiting for account 0
+T303 started : DEPOSIT account 2 amount PHP 2000.00
+T303 completed : DEPOSIT successful
+T303 started : WITHDRAW account 2 amount PHP 5000.00
+T303 completed : WITHDRAW failed
+T301 completed : TRANSFER successful
+T302 completed : TRANSFER successful
+T304 started : BALANCE account 2
+T304 : Account 2 balance = PHP 1000.00
+T305 started : DEPOSIT account 8 amount PHP 1000.00
+T307 started : TRANSFER from 9 to 8 amount PHP 400.00
+T305 completed : DEPOSIT successful
+T305 started : DEPOSIT account 9 amount PHP 1000.00
+T305 completed : DEPOSIT successful
+T307 acquired lock on account 9
+[ DEADLOCK PREVENTED ] Lock ordering : T307 waiting for account 8
+T306 started : TRANSFER from 8 to 9 amount PHP 200.00
+T306 acquired lock on account 8
+[ DEADLOCK PREVENTED ] Lock ordering : T306 waiting for account 9
+T307 completed : TRANSFER successful
+T306 completed : TRANSFER successful
