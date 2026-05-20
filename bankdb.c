@@ -20,6 +20,22 @@
 #define MAX_WORKLOAD_SIZE 10000
 #define BUFFER_POOL_SIZE 5
 
+#ifdef USE_PLAIN_MUTEX
+#define rwlock_t_type pthread_mutex_t
+#define rwlock_init_func(l, a) pthread_mutex_init(l, a)
+#define rwlock_destroy_func(l) pthread_mutex_destroy(l)
+#define rwlock_rdlock_func(l) pthread_mutex_lock(l)
+#define rwlock_wrlock_func(l) pthread_mutex_lock(l)
+#define rwlock_unlock_func(l) pthread_mutex_unlock(l)
+#else
+#define rwlock_t_type pthread_rwlock_t
+#define rwlock_init_func(l, a) pthread_rwlock_init(l, a)
+#define rwlock_destroy_func(l) pthread_rwlock_destroy(l)
+#define rwlock_rdlock_func(l) pthread_rwlock_rdlock(l)
+#define rwlock_wrlock_func(l) pthread_rwlock_wrlock(l)
+#define rwlock_unlock_func(l) pthread_rwlock_unlock(l)
+#endif
+
 typedef enum {
     OP_DEPOSIT,    // Add money to account
     OP_WITHDRAW,   // Remove money from account
@@ -59,7 +75,7 @@ typedef struct {
 typedef struct {
     int account_id ; // Account number
     int balance_centavos ; // Balance in centavos
-    pthread_rwlock_t lock ; // Per - account lock
+    rwlock_t_type lock ; // Per - account lock
 } Account ;
 
 typedef struct {
@@ -293,9 +309,9 @@ void wait_until_tick (int target_tick ) {
 int get_balance ( int account_id ) {
     Account * acc = & bank . accounts [ account_id ];
 
-    pthread_rwlock_rdlock (& acc -> lock ) ;
+    rwlock_rdlock_func (& acc -> lock ) ;
     int balance = acc -> balance_centavos ;
-    pthread_rwlock_unlock (& acc -> lock ) ;
+    rwlock_unlock_func (& acc -> lock ) ;
 
     return balance ;
 }
@@ -303,29 +319,29 @@ int get_balance ( int account_id ) {
 void deposit ( int account_id , int amount_centavos ) {
     Account * acc = & bank . accounts [ account_id ];
 
-    pthread_rwlock_wrlock (& acc -> lock ) ;
+    rwlock_wrlock_func (& acc -> lock ) ;
     acc -> balance_centavos += amount_centavos ;
-    pthread_rwlock_unlock (& acc -> lock ) ;
+    rwlock_unlock_func (& acc -> lock ) ;
 }
 
 bool withdraw ( int account_id , int amount_centavos ) {
     Account * acc = & bank . accounts [ account_id ];
 
-    pthread_rwlock_wrlock (& acc -> lock ) ;
+    rwlock_wrlock_func (& acc -> lock ) ;
 
     if ( acc -> balance_centavos < amount_centavos ) {
-        pthread_rwlock_unlock (& acc -> lock ) ;
+        rwlock_unlock_func (& acc -> lock ) ;
         return false ; // Insufficient funds
     }
 
     acc -> balance_centavos -= amount_centavos ;
-    pthread_rwlock_unlock (& acc -> lock ) ;
+    rwlock_unlock_func (& acc -> lock ) ;
     return true ;
 }
 
 bool acquire_account_lock(int acc_id, int tx_idx) {
     if (strcmp(deadlock_strategy_global, "prevention") == 0) {
-        pthread_rwlock_wrlock(&bank.accounts[acc_id].lock);
+        rwlock_wrlock_func(&bank.accounts[acc_id].lock);
         return true;
     }
 
@@ -372,17 +388,17 @@ bool acquire_account_lock(int acc_id, int tx_idx) {
     waiting_for[tx_idx] = -1;
     pthread_mutex_unlock(&deadlock_lock);
 
-    pthread_rwlock_wrlock(&bank.accounts[acc_id].lock);
+    rwlock_wrlock_func(&bank.accounts[acc_id].lock);
     return true;
 }
 
 void release_account_lock(int acc_id, int tx_idx) {
     if (strcmp(deadlock_strategy_global, "prevention") == 0) {
-        pthread_rwlock_unlock(&bank.accounts[acc_id].lock);
+        rwlock_unlock_func(&bank.accounts[acc_id].lock);
         return;
     }
 
-    pthread_rwlock_unlock(&bank.accounts[acc_id].lock);
+    rwlock_unlock_func(&bank.accounts[acc_id].lock);
 
     pthread_mutex_lock(&deadlock_lock);
     if (owner_tx_idx[acc_id] == tx_idx) {
@@ -445,8 +461,8 @@ bool transfer ( int from_id , int to_id , int amount_centavos, int tx_idx ) {
         Account * acc_second = & bank . accounts [ second ];
 
         uint64_t start_wait = get_time_ns();
-        pthread_rwlock_wrlock (& acc_first -> lock ) ;
-        pthread_rwlock_wrlock (& acc_second -> lock ) ;
+        rwlock_wrlock_func (& acc_first -> lock ) ;
+        rwlock_wrlock_func (& acc_second -> lock ) ;
         uint64_t end_wait = get_time_ns();
         uint64_t tx_wait_ns = end_wait - start_wait;
         
@@ -462,8 +478,8 @@ bool transfer ( int from_id , int to_id , int amount_centavos, int tx_idx ) {
         // Check sufficient funds
         Account * from_acc = & bank . accounts [ from_id ];
         if ( from_acc -> balance_centavos < amount_centavos ) {
-            pthread_rwlock_unlock (& acc_second -> lock ) ;
-            pthread_rwlock_unlock (& acc_first -> lock ) ;
+            rwlock_unlock_func (& acc_second -> lock ) ;
+            rwlock_unlock_func (& acc_first -> lock ) ;
             return false ;
         }
 
@@ -471,8 +487,8 @@ bool transfer ( int from_id , int to_id , int amount_centavos, int tx_idx ) {
         bank . accounts [ from_id ]. balance_centavos -= amount_centavos ;
         bank . accounts [ to_id ]. balance_centavos += amount_centavos ;
 
-        pthread_rwlock_unlock (& acc_second -> lock ) ;
-        pthread_rwlock_unlock (& acc_first -> lock ) ;
+        rwlock_unlock_func (& acc_second -> lock ) ;
+        rwlock_unlock_func (& acc_first -> lock ) ;
         return true ;
     } else {
         // Detection strategy: naive lock ordering with wait-for graph cycle checking
@@ -858,7 +874,7 @@ void init_bank(const char* accounts_filepath) {
     for (int i = 0; i < MAX_ACCOUNTS; i++) {
         bank.accounts[i].account_id = i;
         bank.accounts[i].balance_centavos = 0; // Initialize to 0
-        pthread_rwlock_init(&bank.accounts[i].lock, NULL);
+        rwlock_init_func(&bank.accounts[i].lock, NULL);
     }
 
     FILE* file = fopen(accounts_filepath, "r");
@@ -983,6 +999,8 @@ int main(int argc, char* argv[]) {
     const char* trace_path = NULL;
     const char* deadlock_strategy = NULL;
     int num_workers = NUM_WORKERS;
+    int initial_total = 0;
+    int final_total = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--accounts=", 11) == 0) {
@@ -1061,6 +1079,10 @@ int main(int argc, char* argv[]) {
     fflush(stdout);
     pthread_mutex_unlock(&log_mutex);
 
+    for (int i = 0; i < bank.num_accounts; i++) {
+        initial_total += bank.accounts[i].balance_centavos;
+    }
+
     pthread_create(&timer, NULL, timer_thread, NULL);
     pthread_create(&dispatcher, NULL, dispatcher_thread, NULL);
 
@@ -1097,6 +1119,10 @@ int main(int argc, char* argv[]) {
     
     pthread_join(timer, NULL);
 
+    for (int i = 0; i < bank.num_accounts; i++) {
+        final_total += bank.accounts[i].balance_centavos;
+    }
+
     uint64_t real_end_ns = get_time_ns();
     double real_elapsed_sec = (real_end_ns - real_start_ns) / 1000000000.0;
 
@@ -1118,6 +1144,9 @@ int main(int argc, char* argv[]) {
     printf("Aborted : %d\n", fail);
     printf("Total ticks : %d\n", sim_clock + 1);
     printf("ThreadSanitizer warnings : 0\n");
+    printf("Initial total : PHP %d.%02d\n", initial_total / 100, initial_total % 100);
+    printf("Final total : PHP %d.%02d\n", final_total / 100, final_total % 100);
+    printf("Conservation check : %s\n", (initial_total == final_total) ? "PASSED" : "FAILED");
 
     printf("\n=== Transaction Performance Metrics ===\n");
     printf("TxID | StartTick | ActualStart | End | WaitTicks | Status\n");
@@ -1171,13 +1200,13 @@ int main(int argc, char* argv[]) {
             }
             total_bank_balance += bank.accounts[i].balance_centavos;
         }
-        printf("Total Money in Bank          : %ld centavos\n", total_bank_balance);
+        printf("Total Money in Bank          : %lld centavos\n", (long long)total_bank_balance);
         printf("=========================================\n");
     }
 
     // Clean up resources
     for (int i = 0; i < MAX_ACCOUNTS; i++) {
-        pthread_rwlock_destroy(&bank.accounts[i].lock);
+        rwlock_destroy_func(&bank.accounts[i].lock);
     }
     pthread_mutex_destroy(&bank.bank_lock);
     destroy_buffer(&tx_queue);
