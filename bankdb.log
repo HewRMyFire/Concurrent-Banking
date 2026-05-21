@@ -5,8 +5,8 @@ T4 started : DEPOSIT account 4 amount PHP 10.00
 T5 started : DEPOSIT account 5 amount PHP 10.00
 T4 completed : DEPOSIT successful
 T5 completed : DEPOSIT successful
-T3 completed : DEPOSIT successful
 T1 completed : DEPOSIT successful
+T3 completed : DEPOSIT successful
 T2 completed : DEPOSIT successful
 T6 started : DEPOSIT account 6 amount PHP 10.00
 T6 completed : DEPOSIT successful

@@ -1,0 +1,52 @@
+=== Banking System Execution Log ===
+Timer thread started ( tick interval : 100 ms )
+
+Tick 0:
+T1 started : DEPOSIT account 1 amount PHP 10.00
+T2 started : DEPOSIT account 2 amount PHP 10.00
+T3 started : DEPOSIT account 3 amount PHP 10.00
+T4 started : DEPOSIT account 4 amount PHP 10.00
+T5 started : DEPOSIT account 5 amount PHP 10.00
+
+Tick 1:
+T4 completed : DEPOSIT successful
+T2 completed : DEPOSIT successful
+T5 completed : DEPOSIT successful
+T3 completed : DEPOSIT successful
+T1 completed : DEPOSIT successful
+T6 started : DEPOSIT account 6 amount PHP 10.00
+
+Tick 2:
+T6 completed : DEPOSIT successful
+
+Tick 3:
+
+=== Summary ===
+Total transactions : 6
+Committed : 6
+Aborted : 0
+Total ticks : 4
+ThreadSanitizer warnings : 0
+Initial total : PHP 750.00
+Final total : PHP 810.00
+Conservation check : FAILED
+
+=== Transaction Performance Metrics ===
+TxID | StartTick | ActualStart | End | WaitTicks | Status
+- - - - -| - - - - - - - - - - -| - - - - - - - - - - - - -| - - - - -| - - - - - - - - - - -| - - - - - - - - - -
+T1 | 0 | 0 | 1 | 0 | COMMITTED
+T2 | 0 | 0 | 1 | 0 | COMMITTED
+T3 | 0 | 0 | 1 | 0 | COMMITTED
+T4 | 0 | 0 | 1 | 0 | COMMITTED
+T5 | 0 | 0 | 1 | 0 | COMMITTED
+T6 | 0 | 1 | 2 | 0 | COMMITTED
+
+Average wait time : 0.0 ticks
+Throughput : 6 transactions / 4 ticks = 1.50 tx / tick
+
+=== Buffer Pool Report ===
+Pool size : 5 slots
+Total loads : 6
+Total unloads : 6
+Peak usage : 5 slots
+Blocked operations ( pool full ) : 1
