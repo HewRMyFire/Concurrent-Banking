@@ -1,0 +1,42 @@
+=== Banking System Execution Log ===
+Timer thread started ( tick interval : 100 ms )
+
+Tick 0:
+T1 started : BALANCE account 10
+T1 : Account 10 balance = PHP 100.00
+T2 started : BALANCE account 10
+T2 : Account 10 balance = PHP 100.00
+T3 started : BALANCE account 10
+T3 : Account 10 balance = PHP 100.00
+T4 started : BALANCE account 10
+T4 : Account 10 balance = PHP 100.00
+
+Tick 1:
+
+=== Summary ===
+Total transactions : 4
+Committed : 4
+Aborted : 0
+Total ticks : 2
+ThreadSanitizer warnings : 0
+Initial total : PHP 750.00
+Final total : PHP 750.00
+Conservation check : PASSED
+
+=== Transaction Performance Metrics ===
+TxID | StartTick | ActualStart | End | WaitTicks | Status
+- - - - -| - - - - - - - - - - -| - - - - - - - - - - - - -| - - - - -| - - - - - - - - - - -| - - - - - - - - - -
+T1 | 0 | 0 | 0 | 0 | COMMITTED
+T2 | 0 | 0 | 0 | 0 | COMMITTED
+T3 | 0 | 0 | 0 | 0 | COMMITTED
+T4 | 0 | 0 | 0 | 0 | COMMITTED
+
+Average wait time : 0.0 ticks
+Throughput : 4 transactions / 2 ticks = 2.00 tx / tick
+
+=== Buffer Pool Report ===
+Pool size : 5 slots
+Total loads : 4
+Total unloads : 4
+Peak usage : 1 slots
+Blocked operations ( pool full ) : 0

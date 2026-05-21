@@ -1,0 +1,73 @@
+=== Banking System Execution Log ===
+Timer thread started ( tick interval : 100 ms )
+
+Tick 0:
+T1 started : TRANSFER from 10 to 20 amount PHP 50.00
+T1 acquired lock on account 10
+T2 started : TRANSFER from 20 to 10 amount PHP 30.00
+T2 acquired lock on account 20
+
+Tick 1:
+T1 completed : TRANSFER successful
+
+Tick 2:
+==================
+WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock) (pid=7779)
+  Cycle in lock order graph: M0 (0x55555555e2c8) => M1 (0x55555555e548) => M0
+
+  Mutex M1 acquired here while holding mutex M0 in thread T3:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 acquire_account_lock src/lock_mgr.c:59 (bankdb+0x5663) (BuildId: 605308baa04fac1767acc3d67a11d03a61587932)
+    #2 transfer src/bank.c:150 (bankdb+0x3983) (BuildId: 605308baa04fac1767acc3d67a11d03a61587932)
+    #3 execute_transaction src/transaction.c:222 (bankdb+0x4510) (BuildId: 605308baa04fac1767acc3d67a11d03a61587932)
+
+    Hint: use TSAN_OPTIONS=second_deadlock_stack=1 to get more informative warning message
+
+  Mutex M0 acquired here while holding mutex M1 in thread T4:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 acquire_account_lock src/lock_mgr.c:59 (bankdb+0x5663) (BuildId: 605308baa04fac1767acc3d67a11d03a61587932)
+    #2 transfer src/bank.c:150 (bankdb+0x3983) (BuildId: 605308baa04fac1767acc3d67a11d03a61587932)
+    #3 execute_transaction src/transaction.c:222 (bankdb+0x4510) (BuildId: 605308baa04fac1767acc3d67a11d03a61587932)
+
+  Thread T3 (tid=7784, running) created by thread T2 at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 dispatcher_thread src/transaction.c:372 (bankdb+0x511d) (BuildId: 605308baa04fac1767acc3d67a11d03a61587932)
+
+  Thread T4 (tid=7785, running) created by thread T2 at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 dispatcher_thread src/transaction.c:372 (bankdb+0x511d) (BuildId: 605308baa04fac1767acc3d67a11d03a61587932)
+
+SUMMARY: ThreadSanitizer: lock-order-inversion (potential deadlock) src/lock_mgr.c:59 in acquire_account_lock
+==================
+
+Tick 3:
+T2 completed : TRANSFER successful
+
+Tick 4:
+ThreadSanitizer: reported 1 warnings
+
+=== Summary ===
+Total transactions : 2
+Committed : 2
+Aborted : 0
+Total ticks : 5
+ThreadSanitizer warnings : 0
+Initial total : PHP 750.00
+Final total : PHP 750.00
+Conservation check : PASSED
+
+=== Transaction Performance Metrics ===
+TxID | StartTick | ActualStart | End | WaitTicks | Status
+- - - - -| - - - - - - - - - - -| - - - - - - - - - - - - -| - - - - -| - - - - - - - - - - -| - - - - - - - - - -
+T1 | 0 | 0 | 1 | 0 | COMMITTED
+T2 | 0 | 0 | 3 | 2 | COMMITTED
+
+Average wait time : 1.0 ticks
+Throughput : 2 transactions / 5 ticks = 0.40 tx / tick
+
+=== Buffer Pool Report ===
+Pool size : 5 slots
+Total loads : 4
+Total unloads : 4
+Peak usage : 4 slots
+Blocked operations ( pool full ) : 0
